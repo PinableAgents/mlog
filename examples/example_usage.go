@@ -1,9 +1,9 @@
 package main
 
 import (
-	"mlog"
 	"time"
 
+	"github.com/PinableAgents/mlog"
 	"go.uber.org/zap"
 )
 

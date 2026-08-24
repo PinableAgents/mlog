@@ -1,4 +1,4 @@
-module mlog
+module github.com/PinableAgents/mlog
 
 go 1.24
 
