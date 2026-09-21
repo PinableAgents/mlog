@@ -1,7 +1,7 @@
 package mlog
 
 // Version 当前版本号
-const Version = "0.0.20"
+const Version = "0.0.21"
 
 // BuildTime 构建时间，在构建时通过 ldflags 注入
 var BuildTime string
