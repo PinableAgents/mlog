@@ -1,9 +1,12 @@
 package mlog
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/ai-mmo/lumberjack"
@@ -11,250 +14,312 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// ErrClosed indicates that a stale logger was used after its lifecycle ended.
+var ErrClosed = errors.New("mlog: logger closed")
+
+// ZapCore routes one severity (or all enabled severities in single-file mode).
+// Configuration is immutable for a core's lifetime. With-derived cores share
+// this core's lifecycle and route cache, so they cannot reopen a closed file.
 type ZapCore struct {
-	level       zapcore.Level
-	serviceName string // 保存创建时的服务名称
-	serviceID   uint64 // 保存创建时的服务ID
 	zapcore.Core
-	// 添加 lumberjack logger 引用，用于正确关闭
-	lumberjackLogger *lumberjack.Logger
-	// 缓存编码器，避免重复创建
-	encoder zapcore.Encoder
-	// 缓存特殊目录的 lumberjack logger，避免重复创建和 goroutine 泄露
-	specialLoggers map[string]*lumberjack.Logger
-	// 保护 specialLoggers 的互斥锁
-	specialLoggersMutex sync.RWMutex
+	syncer              zapcore.WriteSyncer
+	level               zapcore.Level
+	serviceName         string
+	serviceID           uint64
+	config              ZapConfig
+	levelControl        zap.AtomicLevel
+	encoder             zapcore.Encoder
+	lumberjackLogger    io.WriteCloser
+	specialLoggers      map[string]io.WriteCloser
+	mu                  sync.RWMutex
+	specialLoggersMutex sync.Mutex
+	closed              bool
 }
 
-// NewZapCoreWithService 创建带有指定服务信息的 ZapCore（优化版本）
-func NewZapCoreWithService(level zapcore.Level, svcName string, svcID uint64) *ZapCore {
-	// 直接使用传入的服务信息，避免访问全局变量
-	entity := &ZapCore{
-		level:          level,
-		serviceName:    svcName,
-		serviceID:      svcID,
-		specialLoggers: make(map[string]*lumberjack.Logger),
-	}
-	syncer := entity.WriteSyncer()
-
-	// 创建并缓存编码器，避免重复创建
-	encoder := zapConfig.Encoder()
-	entity.encoder = encoder
-
-	// 【修复】使用动态级别控制器
-	// 根据SingleFile配置决定过滤逻辑：
-	// - 单文件模式：每个Core处理 >= 自己级别的所有日志（避免重复）
-	// - 多文件模式：每个Core只处理 == 自己级别的日志（分文件）
-	levelEnabler := zap.LevelEnablerFunc(func(l zapcore.Level) bool {
-		if zapConfig.SingleFile {
-			// 单文件模式：Core的level是它能记录的最低级别
-			// 只要日志级别 >= Core的level 且 >= 全局设置的级别，就应该记录
-			return l >= level && l >= atomicLevel.Level()
-		}
-		// 多文件模式：每个Core只处理完全匹配的级别
-		// 避免同一条日志被多个Core重复写入
-		return l == level && l >= atomicLevel.Level()
-	})
-	entity.Core = zapcore.NewCore(encoder, syncer, levelEnabler)
-	return entity
+func NewZapCoreWithService(level zapcore.Level, name string, id uint64) *ZapCore {
+	globalMutex.RLock()
+	cfg, control := zapConfig, atomicLevel
+	globalMutex.RUnlock()
+	return newZapCoreWithConfig(level, name, id, cfg, control)
 }
 
-// getLogFileName 根据配置获取日志文件名
-// 如果启用了单文件模式，返回配置的单文件名或默认的 "all.log"
-// 否则返回基于日志级别的文件名，如 "debug.log"、"info.log" 等
+func newZapCoreWithConfig(level zapcore.Level, name string, id uint64, cfg ZapConfig, control zap.AtomicLevel) *ZapCore {
+	z := &ZapCore{level: level, serviceName: name, serviceID: id, config: cfg,
+		levelControl: control, encoder: cfg.Encoder(), specialLoggers: make(map[string]io.WriteCloser)}
+	z.syncer = z.WriteSyncer()
+	z.Core = zapcore.NewCore(z.encoder, z.syncer, zap.LevelEnablerFunc(z.Enabled))
+	return z
+}
+
 func (z *ZapCore) getLogFileName() string {
-	// 如果启用了单文件模式
-	if zapConfig.SingleFile {
-		// 如果配置了自定义文件名，使用自定义文件名
-		if zapConfig.SingleFileName != "" {
-			return zapConfig.SingleFileName
+	if z.config.SingleFile {
+		if z.config.SingleFileName != "" {
+			return z.config.SingleFileName
 		}
-		// 否则使用默认文件名
 		return "all.log"
 	}
-	// 按级别分文件模式，使用级别名称作为文件名
 	return z.level.String() + ".log"
 }
 
 func (z *ZapCore) WriteSyncer(formats ...string) zapcore.WriteSyncer {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	if z.closed {
+		return errorSyncer{ErrClosed}
+	}
 	return z.createWriteSyncer(z.serviceName, z.serviceID, formats...)
 }
 
-// createWriteSyncer 创建写入同步器，接受服务名称和ID作为参数以避免锁竞争
-func (z *ZapCore) createWriteSyncer(currentServiceName string, currentServiceID uint64, formats ...string) zapcore.WriteSyncer {
-	// 构建包含服务名称的日志目录路径
-	logDir := zapConfig.Director
-	if currentServiceID != 0 {
-		logDir = filepath.Join(zapConfig.Director, fmt.Sprintf("%d", currentServiceID))
+// validComponent applies portable rules: Linux must also reject Windows
+// traversal, drive prefixes, alternate data streams and reserved device names.
+func validComponent(s string) bool {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, "/\\:\x00*?\"<>|") || strings.TrimRight(s, ". ") != s {
+		return false
 	}
-	// 有具体服务的名字要加入到目录中
-	if currentServiceName != "" {
-		logDir = filepath.Join(logDir, currentServiceName)
+	for _, r := range s {
+		if r < 32 {
+			return false
+		}
 	}
-	// 如果有额外的格式化目录（如business、folder等），添加到路径中
-	if len(formats) > 0 && formats[0] != "" {
-		logDir = filepath.Join(logDir, formats[0])
+	base := strings.ToUpper(strings.SplitN(s, ".", 2)[0])
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
+		return false
 	}
-	// 确保目录存在
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		// 如果创建目录失败，使用默认目录
-		logDir = zapConfig.Director
-		os.MkdirAll(logDir, 0755)
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9' {
+		return false
 	}
+	return true
+}
 
-	var lumberjackLogger *lumberjack.Logger
+func validateRoute(route string) error {
+	if route == "" {
+		return nil
+	}
+	for _, part := range strings.Split(route, "/") {
+		if !validComponent(part) {
+			return fmt.Errorf("mlog: invalid route %q", route)
+		}
+	}
+	return nil
+}
 
-	// 获取日志文件名（根据配置决定是单文件还是按级别分文件）
-	logFileName := z.getLogFileName()
+type errorSyncer struct{ err error }
 
-	// 如果是特殊目录，使用缓存的 logger 避免重复创建和 goroutine 泄露
-	if len(formats) > 0 && formats[0] != "" {
-		// 构建缓存键：目录路径 + 文件名
-		cacheKey := filepath.Join(logDir, logFileName)
+func (w errorSyncer) Write([]byte) (int, error) { return 0, w.err }
+func (w errorSyncer) Sync() error               { return w.err }
 
-		z.specialLoggersMutex.RLock()
-		cachedLogger, exists := z.specialLoggers[cacheKey]
-		z.specialLoggersMutex.RUnlock()
-
-		if exists {
-			// 使用缓存的 logger
-			lumberjackLogger = cachedLogger
+func (z *ZapCore) createWriteSyncer(name string, id uint64, formats ...string) zapcore.WriteSyncer {
+	dir := z.config.Director
+	if id != 0 {
+		dir = filepath.Join(dir, fmt.Sprint(id))
+	}
+	if name != "" {
+		if !validComponent(name) {
+			return errorSyncer{fmt.Errorf("mlog: invalid service name %q", name)}
+		}
+		dir = filepath.Join(dir, name)
+	}
+	route := ""
+	if len(formats) > 0 {
+		route = formats[0]
+	}
+	if err := validateRoute(route); err != nil {
+		return errorSyncer{err}
+	}
+	file := z.getLogFileName()
+	if !validComponent(file) {
+		return errorSyncer{fmt.Errorf("mlog: invalid filename %q", file)}
+	}
+	dir = filepath.Join(dir, route)
+	path := filepath.Join(dir, file)
+	z.specialLoggersMutex.Lock()
+	defer z.specialLoggersMutex.Unlock()
+	writer := z.lumberjackLogger
+	if route != "" {
+		writer = z.specialLoggers[path]
+	}
+	if writer == nil {
+		if route != "" && z.config.MaxRouteWriters > 0 && len(z.specialLoggers) >= z.config.MaxRouteWriters {
+			return errorSyncer{errors.New("mlog: route writer limit reached")}
+		}
+		// Root and service directories must be controlled by the application.
+		// Check existing descendant symlinks; this is defense in depth, not a
+		// substitute for filesystem permissions against hostile local processes.
+		if err := prepareLogDirectory(z.config.Director, dir); err != nil {
+			return errorSyncer{err}
+		}
+		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return errorSyncer{fmt.Errorf("mlog: symlink logfile %q", path)}
+		}
+		writer = &lumberjack.Logger{Filename: path, MaxSize: z.config.MaxSize, MaxBackups: z.config.MaxBackups,
+			MaxAge: z.config.RetentionDay, Compress: z.config.EnableCompress, LocalTime: true}
+		if route != "" {
+			z.specialLoggers[path] = writer
 		} else {
-			// 创建新的 logger 并缓存
-			lumberjackLogger = &lumberjack.Logger{
-				Filename:   filepath.Join(logDir, logFileName),
-				MaxSize:    zapConfig.MaxSize,        // MB
-				MaxBackups: zapConfig.MaxBackups,     // 保留备份文件数量
-				MaxAge:     zapConfig.RetentionDay,   // 保留天数
-				Compress:   zapConfig.EnableCompress, // 是否压缩
-				LocalTime:  true,                     // 使用本地时间
+			z.lumberjackLogger = writer
+		}
+	}
+	if z.config.LogInConsole {
+		return zapcore.NewMultiWriteSyncer(zapcore.AddSync(writer), zapcore.Lock(os.Stdout))
+	}
+	return zapcore.AddSync(writer)
+}
+
+func prepareLogDirectory(root, dir string) error {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return err
+	}
+	if !filepath.IsLocal(rel) {
+		return fmt.Errorf("mlog: directory outside root")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	current := root
+	if rel != "." {
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			current = filepath.Join(current, part)
+			if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("mlog: symlink directory %q", current)
 			}
-
-			// 缓存新创建的 logger
-			z.specialLoggersMutex.Lock()
-			z.specialLoggers[cacheKey] = lumberjackLogger
-			z.specialLoggersMutex.Unlock()
+			if err := os.MkdirAll(current, 0700); err != nil {
+				return err
+			}
 		}
-	} else {
-		// 主要的 lumberjack logger（非特殊目录）
-		lumberjackLogger = &lumberjack.Logger{
-			Filename:   filepath.Join(logDir, logFileName),
-			MaxSize:    zapConfig.MaxSize,        // MB
-			MaxBackups: zapConfig.MaxBackups,     // 保留备份文件数量
-			MaxAge:     zapConfig.RetentionDay,   // 保留天数
-			Compress:   zapConfig.EnableCompress, // 是否压缩
-			LocalTime:  true,                     // 使用本地时间
-		}
-
-		// 保存主要的 lumberjack logger 引用，用于后续关闭
-		z.lumberjackLogger = lumberjackLogger
 	}
-
-	// 同步日志写入 到 控制台
-	if zapConfig.LogInConsole {
-		multiSyncer := zapcore.NewMultiWriteSyncer(os.Stdout, zapcore.AddSync(lumberjackLogger))
-		return multiSyncer
-	}
-	return zapcore.AddSync(lumberjackLogger)
+	return nil
 }
 
 func (z *ZapCore) Enabled(level zapcore.Level) bool {
-	// 【修复】根据SingleFile配置决定过滤逻辑
-	currentAtomicLevel := atomicLevel.Level()
-
-	if zapConfig.SingleFile {
-		// 单文件模式：Core的level是它能记录的最低级别
-		return level >= z.level && level >= currentAtomicLevel
+	if z.config.SingleFile {
+		return level >= z.level && z.levelControl.Enabled(level)
 	}
-	// 多文件模式：每个Core只处理完全匹配的级别
-	return level == z.level && level >= currentAtomicLevel
+	return level == z.level && z.levelControl.Enabled(level)
 }
 
+// boundCore eagerly encodes structured context, matching Zap's With contract.
+// Mutable values need caller synchronization only while With/logging executes.
+type boundCore struct {
+	root     *ZapCore
+	core     zapcore.Core
+	encoder  zapcore.Encoder
+	route    string
+	routeErr error
+}
+
+func (z *ZapCore) bind(enc zapcore.Encoder, route string, routeErr error, fields []zapcore.Field) zapcore.Core {
+	newRoute, filtered, err := z.routeFields(fields)
+	if newRoute != "" {
+		route = newRoute
+	}
+	if err != nil {
+		routeErr = err
+	}
+	owned := enc.Clone()
+	for _, f := range filtered {
+		f.AddTo(owned)
+	}
+	return &boundCore{z, zapcore.NewCore(owned, z.syncer, zap.LevelEnablerFunc(z.Enabled)), owned, route, routeErr}
+}
 func (z *ZapCore) With(fields []zapcore.Field) zapcore.Core {
-	return z.Core.With(fields)
+	return z.bind(z.encoder, "", nil, fields)
 }
-
-func (z *ZapCore) Check(entry zapcore.Entry, check *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-	// 使用 Enabled 方法检查是否应该记录日志
-	if z.Enabled(entry.Level) {
-		return check.AddCore(entry, z)
+func (b *boundCore) Enabled(l zapcore.Level) bool { return b.root.Enabled(l) }
+func (b *boundCore) With(fields []zapcore.Field) zapcore.Core {
+	return b.root.bind(b.encoder, b.route, b.routeErr, fields)
+}
+func (b *boundCore) Check(e zapcore.Entry, c *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if b.Enabled(e.Level) {
+		return c.AddCore(e, b)
 	}
-	return check
+	return c
 }
-
-func (z *ZapCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
-	// 创建一个新的 fields 切片，用于存储处理后的字段
-	filteredFields := make([]zapcore.Field, 0, len(fields))
-
-	// 检查是否有特殊目录字段，但不修改原始 Core
-	var specialDirectory string
-	hasSpecialDirectory := false
-	// 如果未启用了单文件模式，则需要检查是否有特殊目录，单文件模式不用检查
-	if !zapConfig.SingleFile {
-		for i := 0; i < len(fields); i++ {
-			if fields[i].Key == "business" || fields[i].Key == "folder" {
-				// business 和 folder 字段总是创建子目录
-				specialDirectory = fields[i].String
-				hasSpecialDirectory = true
-				// 不将此字段添加到 filteredFields 中，实现移除效果
-			} else if fields[i].Key == "directory" {
-				// directory 字段创建子目录（仅对当前日志生效）
-				specialDirectory = fields[i].String
-				hasSpecialDirectory = true
-				// 不将此字段添加到 filteredFields 中，避免在日志内容中显示
-			} else {
-				// 保留其他字段
-				filteredFields = append(filteredFields, fields[i])
+func (b *boundCore) Write(e zapcore.Entry, f []zapcore.Field) error {
+	return b.root.writeEncoded(b.core, b.encoder, b.route, b.routeErr, e, f)
+}
+func (b *boundCore) Sync() error { return b.root.Sync() }
+func (z *ZapCore) Check(e zapcore.Entry, c *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if z.Enabled(e.Level) {
+		return c.AddCore(e, z)
+	}
+	return c
+}
+func (z *ZapCore) routeFields(fields []zapcore.Field) (string, []zapcore.Field, error) {
+	if z.config.SingleFile {
+		return "", fields, nil
+	}
+	filtered := make([]zapcore.Field, 0, len(fields))
+	route := ""
+	for _, f := range fields {
+		if f.Key == "business" || f.Key == "folder" || f.Key == "directory" {
+			if f.Type != zapcore.StringType {
+				return "", nil, errors.New("mlog: route must be a string")
 			}
+			route = f.String
+		} else {
+			filtered = append(filtered, f)
 		}
 	}
-	// 根据是否有特殊目录字段来决定使用哪个 Core
-	if hasSpecialDirectory {
-		// 创建临时的 Core 用于这次写入，不影响原始 Core
-		// 使用缓存的编码器，避免重复创建
-		syncer := z.createWriteSyncer(z.serviceName, z.serviceID, specialDirectory)
-		tempCore := zapcore.NewCore(z.encoder, syncer, z.level)
-		return tempCore.Write(entry, filteredFields)
+	return route, filtered, nil
+}
+func (z *ZapCore) Write(e zapcore.Entry, f []zapcore.Field) error {
+	return z.writeEncoded(z.Core, z.encoder, "", nil, e, f)
+}
+func (z *ZapCore) writeEncoded(core zapcore.Core, enc zapcore.Encoder, route string, routeErr error, e zapcore.Entry, fields []zapcore.Field) error {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	if z.closed {
+		return ErrClosed
 	}
-	// 使用原始的 Core（写入主日志目录）
-	return z.Core.Write(entry, filteredFields)
+	if routeErr != nil {
+		return routeErr
+	}
+	current, filtered, err := z.routeFields(fields)
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		route = current
+	}
+	if route != "" {
+		return zapcore.NewCore(enc, z.createWriteSyncer(z.serviceName, z.serviceID, route), z.level).Write(e, filtered)
+	}
+	return core.Write(e, filtered)
 }
 
 func (z *ZapCore) Sync() error {
-	return z.Core.Sync()
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	if z.closed {
+		return ErrClosed
+	}
+	err := z.Core.Sync()
+	if isHarmlessSyncError(err) {
+		return nil
+	}
+	return err
 }
 
-// Close 关闭 ZapCore，包括关闭 lumberjack logger 以防止 goroutine 泄露
 func (z *ZapCore) Close() error {
-	// 先同步日志（忽略无害错误）
-	if err := z.Core.Sync(); err != nil {
-		// 检查是否为无害错误
-		if !isHarmlessSyncError(err) {
-			// 只记录真正的错误
-			fmt.Fprintf(os.Stderr, "[mlog] ZapCore 同步失败: %v\n", err)
-		}
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if z.closed {
+		return nil
 	}
-
-	// 关闭主要的 lumberjack logger
-	if z.lumberjackLogger != nil {
-		if err := z.lumberjackLogger.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "[mlog] 关闭主要 lumberjack logger 失败: %v\n", err)
-		}
-		z.lumberjackLogger = nil
+	z.closed = true
+	errs := []error{z.Core.Sync()}
+	if isHarmlessSyncError(errs[0]) {
+		errs[0] = nil
 	}
-
-	// 关闭所有缓存的特殊目录 logger
 	z.specialLoggersMutex.Lock()
-	for cacheKey, logger := range z.specialLoggers {
-		if logger != nil {
-			if err := logger.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "[mlog] 关闭特殊目录 lumberjack logger 失败 [%s]: %v\n", cacheKey, err)
-			}
-		}
+	defer z.specialLoggersMutex.Unlock()
+	if z.lumberjackLogger != nil {
+		errs = append(errs, z.lumberjackLogger.Close())
 	}
-	// 清空缓存
-	z.specialLoggers = make(map[string]*lumberjack.Logger)
-	z.specialLoggersMutex.Unlock()
-
-	return nil
+	for _, w := range z.specialLoggers {
+		errs = append(errs, w.Close())
+	}
+	z.specialLoggers = nil
+	return errors.Join(errs...)
 }

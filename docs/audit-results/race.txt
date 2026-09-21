@@ -1,0 +1,2 @@
+ok  	github.com/PinableAgents/mlog	23.849s
+ok  	github.com/PinableAgents/mlog/examples	1.023s

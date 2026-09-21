@@ -1,0 +1,36 @@
+goos: linux
+goarch: amd64
+pkg: github.com/PinableAgents/mlog/benchmarks
+cpu: INTEL(R) XEON(R) PLATINUM 8573C
+BenchmarkFile/five-fields/mlog-sync-4         	  126033	      1828 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFile/five-fields/mlog-sync-4         	  140834	      1792 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFile/five-fields/mlog-sync-4         	  137875	      1849 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFile/five-fields/mlog-sync-4         	  129633	      1758 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFile/five-fields/mlog-sync-4         	  117525	      1806 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFile/five-fields/mlog-async-drained-4         	   99040	      2277 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFile/five-fields/mlog-async-drained-4         	  110223	      2307 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFile/five-fields/mlog-async-drained-4         	  104086	      2235 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFile/five-fields/mlog-async-drained-4         	  106864	      2283 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFile/five-fields/mlog-async-drained-4         	  122707	      2335 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFile/five-fields/zap-4                        	  151636	      1671 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFile/five-fields/zap-4                        	  124527	      1690 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFile/five-fields/zap-4                        	  145543	      1613 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFile/five-fields/zap-4                        	  145389	      1603 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFile/five-fields/zap-4                        	  145561	      1662 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFile/five-fields/slog-4                       	   99423	      2503 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFile/five-fields/slog-4                       	   94562	      2789 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFile/five-fields/slog-4                       	   84750	      2673 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFile/five-fields/slog-4                       	   90459	      2779 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFile/five-fields/slog-4                       	   83632	      3167 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFile/five-fields/zerolog-4                    	  223807	      1209 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFile/five-fields/zerolog-4                    	  199904	      1147 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFile/five-fields/zerolog-4                    	  209528	      1172 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFile/five-fields/zerolog-4                    	  227228	      1196 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFile/five-fields/zerolog-4                    	  210321	      1226 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFile/five-fields/logrus-4                     	   41320	      6501 ns/op	    2281 B/op	      35 allocs/op
+BenchmarkFile/five-fields/logrus-4                     	   38731	      5378 ns/op	    2281 B/op	      35 allocs/op
+BenchmarkFile/five-fields/logrus-4                     	   44185	      5782 ns/op	    2281 B/op	      35 allocs/op
+BenchmarkFile/five-fields/logrus-4                     	   44434	      5408 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkFile/five-fields/logrus-4                     	   42274	      5628 ns/op	    2281 B/op	      35 allocs/op
+PASS
+ok  	github.com/PinableAgents/mlog/benchmarks	8.792s

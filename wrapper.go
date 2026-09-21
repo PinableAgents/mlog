@@ -1,14 +1,14 @@
 package mlog
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
-	"time"
-	"unsafe"
+	"syscall"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -16,14 +16,12 @@ import (
 )
 
 var (
-	stopFlag    int32
-	stopNetFlag int32
-	zapConfig   ZapConfig
-	atomicLevel zap.AtomicLevel
-	initialized int32
-	// 优化的无锁logger访问
-	loggerPtr unsafe.Pointer // *zap.Logger，使用unsafe.Pointer实现无锁访问
-	// 优化的日志级别缓存（原子操作）
+	stopFlag          int32
+	stopNetFlag       int32
+	zapConfig         ZapConfig
+	atomicLevel       = zap.NewAtomicLevelAt(zapcore.InfoLevel)
+	initialized       int32
+	loggerPtr         atomic.Pointer[zap.Logger]
 	debugEnabledCache int32
 	infoEnabledCache  int32
 	warnEnabledCache  int32
@@ -31,125 +29,81 @@ var (
 )
 
 func LoadConfig(configPath string) (*ZapConfig, error) {
-	// 读取配置文件
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
 	var config ZapConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
-	zapConfig = config
 	return &config, nil
 }
 
-// GetConfig 获取当前的 ZapConfig 配置
-// 返回当前正在使用的日志配置的副本
 func GetConfig() *ZapConfig {
-	globalMutex.Lock()
-	defer globalMutex.Unlock()
+	globalMutex.RLock()
+	defer globalMutex.RUnlock()
 
-	// 返回配置的副本，避免外部修改影响内部状态
 	config := zapConfig
 	return &config
 }
 
+// InitialZap retains the legacy panic-on-configuration-error API.
 func InitialZap(name string, id uint64, logLevel string, zc *ZapConfig) {
+	if err := InitialZapChecked(name, id, logLevel, zc); err != nil {
+		panic(err)
+	}
+}
+
+// InitialZapChecked validates a copied configuration and replaces the old
+// lifecycle after draining it. Stop producers before reconfiguration when no
+// rejected records are acceptable. It is safe (but not lossless) to race calls
+// with reconfiguration or Close; stale cores reject writes with ErrClosed.
+func InitialZapChecked(name string, id uint64, logLevel string, zc *ZapConfig) error {
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
-
-	// 如果已经初始化，先关闭现有的日志器
-	if atomic.LoadInt32(&initialized) == 1 {
-		if logger := (*zap.Logger)(atomic.LoadPointer(&loggerPtr)); logger != nil {
-			logger.Sync() // 确保所有日志都被写入
-		}
-		if zapLogger != nil {
-			zapLogger.Sync() // 兼容性：同时同步旧的logger
-		}
-
-		// 关闭现有的 ZapCore 实例，防止 lumberjack goroutine 泄露
-		coreMutex.Lock()
-		for _, core := range zapCores {
-			if core != nil {
-				if err := core.Close(); err != nil {
-					fmt.Fprintf(os.Stderr, "关闭现有 ZapCore 失败: %v\n", err)
-				}
-			}
-		}
-		coreMutex.Unlock()
-	}
-
+	cfg := zapConfig
 	if zc != nil {
-		zapConfig = *zc
+		cfg = *zc
 	}
-	// 如果提供了 logLevel 参数，优先使用它
-	finalLevel := zapConfig.Level
 	if logLevel != "" {
-		finalLevel = logLevel
-		zapConfig.Level = logLevel
+		cfg.Level = logLevel
 	}
-
-	// 初始化原子级别控制器
-	level, err := zapcore.ParseLevel(finalLevel)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if name != "" && !validComponent(name) {
+		return fmt.Errorf("mlog: invalid service name %q", name)
+	}
+	closeLocked()
+	zapConfig = cfg
+	level, _ := zapcore.ParseLevel(cfg.Level)
+	atomicLevel.SetLevel(level)
+	logger, err := initZap(name, id)
 	if err != nil {
-		level = zapcore.InfoLevel
+		return err
 	}
-	atomicLevel = zap.NewAtomicLevelAt(level)
-
-	// 更新优化的日志级别缓存
-	updateLevelCacheOptimized(atomicLevel.Level())
-
-	// 初始化zap日志库
-	logger := initZap(name, id)
-
-	// 原子更新logger指针（无锁访问）
-	atomic.StorePointer(&loggerPtr, unsafe.Pointer(logger))
-
-	// 兼容性：保持旧的全局变量
+	loggerPtr.Store(logger)
 	zapLogger = logger
 	zap.ReplaceGlobals(logger)
-
-	// 初始化异步日志器（如果启用）
-	if zapConfig.EnableAsync {
+	atomic.StoreInt32(&initialized, 1)
+	updateLevelCacheOptimized(level)
+	if cfg.EnableAsync {
 		asyncMutex.Lock()
-		// 关闭现有的异步日志器
-		if globalAsyncLogger != nil {
-			globalAsyncLogger.close()
-		}
-
-		// 设置默认值
-		bufferSize := zapConfig.AsyncBufferSize
-		if bufferSize <= 0 {
-			bufferSize = 10000 // 默认缓冲区大小
-		}
-
-		globalAsyncLogger = newAsyncLogger(bufferSize, zapConfig.AsyncDropOnFull)
+		globalAsyncLogger = newAsyncLoggerFor(cfg.AsyncBufferSize, cfg.AsyncDropOnFull, logger, cfg.ShowLine)
 		asyncMutex.Unlock()
 	}
-	// 初始化路径缓存（如果启用）
-	if zapConfig.UseRelativePath {
+	if cfg.UseRelativePath {
 		initPathCache()
-		// 如果配置了编译根目录，更新缓存
-		if zapConfig.BuildRootPath != "" {
-			updateBuildRoot(zapConfig.BuildRootPath)
-		}
+		updateBuildRoot(cfg.BuildRootPath)
+	} else {
+		globalPathCache.Store(nil)
 	}
-
-	// 标记为已初始化
-	atomic.StoreInt32(&initialized, 1)
-
-	// 仅在控制台模式输出初始化信息（简洁版本）
-	if zapConfig.LogInConsole {
-		asyncMode := "sync"
-		if zapConfig.EnableAsync {
-			asyncMode = "async"
-		}
-		fmt.Printf("[mlog] 初始化完成 service=%s id=%d level=%s mode=%s\n",
-			name, id, finalLevel, asyncMode)
-	}
+	return nil
 }
 
 func GLOG() *zap.Logger {
@@ -157,9 +111,6 @@ func GLOG() *zap.Logger {
 }
 
 func updateLevelCacheOptimized(currentLevel zapcore.Level) {
-	// 使用原子操作更新级别缓存
-	// 注意：zapcore.Level 的值：Debug=-1, Info=0, Warn=1, Error=2
-	// 当设置的级别 <= 某个级别时，该级别应该被启用
 	if currentLevel <= zapcore.DebugLevel {
 		atomic.StoreInt32(&debugEnabledCache, 1)
 	} else {
@@ -189,7 +140,7 @@ func getLoggerOptimized() *zap.Logger {
 	if atomic.LoadInt32(&initialized) == 0 {
 		return nil
 	}
-	return (*zap.Logger)(atomic.LoadPointer(&loggerPtr))
+	return loggerPtr.Load()
 }
 
 func getLogger() (*zap.Logger, bool) {
@@ -197,172 +148,138 @@ func getLogger() (*zap.Logger, bool) {
 	return logger, logger != nil
 }
 
-// isDebugEnabledFast 快速检查Debug级别是否启用
 func isDebugEnabledFast() bool {
 	return atomic.LoadInt32(&debugEnabledCache) == 1
 }
 
-// isInfoEnabledFast 快速检查Info级别是否启用
 func isInfoEnabledFast() bool {
 	return atomic.LoadInt32(&infoEnabledCache) == 1
 }
 
-// isWarnEnabledFast 快速检查Warn级别是否启用
 func isWarnEnabledFast() bool {
 	return atomic.LoadInt32(&warnEnabledCache) == 1
 }
 
-// isErrorEnabledFast 快速检查Error级别是否启用
 func isErrorEnabledFast() bool {
 	return atomic.LoadInt32(&errorEnabledCache) == 1
 }
 
-// isInitialized 检查日志系统是否已初始化
 func isInitialized() bool {
 	return atomic.LoadInt32(&initialized) == 1
 }
 
-// UpdateLevel 动态更新日志级别
 func UpdateLevel(logLevel string) {
-	// 使用全局锁保护整个更新过程，避免竞态条件
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 
 	zapUpdateLevel(logLevel)
-	// 更新优化的级别缓存
 	if atomicLevel.Level() != zapcore.InvalidLevel {
 		updateLevelCacheOptimized(atomicLevel.Level())
 	}
-	// 更新异步日志器的级别缓存
 	UpdateAsyncLevelCache()
 }
 
-// CheckLevel 检查指定的日志级别是否有效
 func CheckLevel(logLevel string) bool {
 	return zapCheckLevel(logLevel)
 }
 
-// Close 关闭日志系统
-func Close() {
-	// 关闭异步日志器
+func Close() { globalMutex.Lock(); defer globalMutex.Unlock(); closeLocked() }
+
+func closeLocked() {
+	// Detach the queue first. Workers hold a logger from their own generation.
 	asyncMutex.Lock()
-	if globalAsyncLogger != nil {
-		globalAsyncLogger.close()
-		globalAsyncLogger = nil
-	}
+	old := globalAsyncLogger
+	globalAsyncLogger = nil
 	asyncMutex.Unlock()
-
-	// 关闭同步日志器（使用优化的获取方式）
-	logger := getLoggerOptimized()
-	if logger != nil {
-		// 智能同步：只对文件输出进行同步，避免 stdout/stderr 同步错误
-		if err := syncLoggerSafely(logger); err != nil {
-			// 只有在真正的错误情况下才输出错误信息
-			fmt.Fprintf(os.Stderr, "日志同步失败: %v\n", err)
-		}
+	if old != nil {
+		old.Close()
 	}
-
-	// 关闭所有 ZapCore 实例，防止 lumberjack goroutine 泄露
+	atomic.StoreInt32(&initialized, 0)
+	updateLevelCacheOptimized(zapcore.FatalLevel)
+	loggerPtr.Store(nil)
 	coreMutex.Lock()
 	for _, core := range zapCores {
-		if core != nil {
-			if err := core.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "关闭 ZapCore 失败: %v\n", err)
-			}
+		if err := core.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "mlog close: %v\n", err)
 		}
 	}
-	// 清空 zapCores 切片
 	zapCores = nil
 	coreMutex.Unlock()
-
-	// 清理优化的logger指针
-	atomic.StorePointer(&loggerPtr, nil)
-
-	// 重置初始化标志
-	atomic.StoreInt32(&initialized, 0)
+	zapLogger = nil
+	zap.ReplaceGlobals(zap.NewNop())
 }
 
-// Debug 输出调试级别日志 兼容
+// Flush waits for records accepted before its queue barrier, then invokes Sync.
+// The bundled rolling writer does not expose fsync: this is NOT a disk-durability
+// guarantee. Flush does not disable asynchronous logging.
+func Flush() error {
+	globalMutex.RLock()
+	defer globalMutex.RUnlock()
+	if al, ok := getAsyncLogger(); ok {
+		al.Flush()
+	}
+	if logger := getLoggerOptimized(); logger != nil {
+		return syncLoggerSafely(logger)
+	}
+	return nil
+}
+
 func Debug(msg string, args ...any) {
-	// 快速预检查，避免不必要的处理
 	if !isDebugEnabledFast() {
 		return
 	}
-	// 有参数时使用原有的格式化逻辑
 	zapDebug(msg, args...)
 }
 
-// DebugW 输出带结构化字段的调试级别日志
 func DebugW(msg string, fields ...zap.Field) {
-	// 快速预检查，避免不必要的处理
 	if !isDebugEnabledFast() {
 		return
 	}
-	// 检查是否使用异步模式
 	if isAsyncEnabled() {
 		debugAsync(msg, nil, fields...)
 		return
 	}
-	// 获取日志构造器
 	logger := getLoggerOptimized()
 	if logger == nil {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.DebugW() -> logger.Debug()
-	// 需要跳过 1 层：mlog.DebugW()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 	loggerWithSkip.Debug(msg, fields...)
 }
 
-// Info 输出信息级别日志
 func Info(msg string, args ...any) {
-	// 快速预检查，避免不必要的处理
 	if !isInfoEnabledFast() {
 		return
 	}
-	// 有参数时使用原有的格式化逻辑
 	zapInfo(msg, args...)
 }
 
-// InfoW 输出带结构化字段的信息级别日志
 func InfoW(msg string, fields ...zap.Field) {
-	// 快速预检查
 	if !isInfoEnabledFast() {
 		return
 	}
-	// 检查是否使用异步模式
 	if isAsyncEnabled() {
 		infoAsync(msg, nil, fields...)
 		return
 	}
-	// 获取日志构造器
 	logger := getLoggerOptimized()
 	if logger == nil {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.InfoW() -> logger.Info()
-	// 需要跳过 1 层：mlog.InfoW()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 	loggerWithSkip.Info(msg, fields...)
 }
 
 func Warn(msg string, args ...any) {
-	// 快速预检查，避免不必要的处理
 	if !isWarnEnabledFast() {
 		return
 	}
-	// 有参数时使用原有的格式化逻辑
 	zapWarn(msg, args...)
 }
 
 func WarnW(msg string, fields ...zap.Field) {
-	// 快速预检查
 	if !isWarnEnabledFast() {
 		return
 	}
@@ -370,152 +287,99 @@ func WarnW(msg string, fields ...zap.Field) {
 		warnAsync(msg, nil, fields...)
 		return
 	}
-	// 获取日志构造器
 	logger := getLoggerOptimized()
 	if logger == nil {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.WarnW() -> logger.Warn()
-	// 需要跳过 1 层：mlog.WarnW()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 	loggerWithSkip.Warn(msg, fields...)
 }
 
 func Error(arg0 string, args ...interface{}) {
-	// 快速预检查，避免不必要的处理
 	if !isErrorEnabledFast() {
 		return
 	}
-	// 有参数时使用原有的格式化逻辑
 	zapError(arg0, args...)
 }
 
-// ErrorW 输出带结构化字段的错误级别日志
 func ErrorW(msg string, fields ...zap.Field) {
-	// 快速预检查
 	if !isErrorEnabledFast() {
 		return
 	}
 
-	// 检查是否使用异步模式
 	if isAsyncEnabled() {
 		errorAsync(msg, nil, fields...)
 		return
 	}
 	logger := getLoggerOptimized()
 	if logger == nil {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.ErrorW() -> logger.Error()
-	// 需要跳过 1 层：mlog.ErrorW()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 	loggerWithSkip.Error(msg, fields...)
 }
 
-// ReturnError 输出错误日志并返回error对象
 func ReturnError(msg string, args ...any) error {
 	return zapReturnError(msg, args...)
 }
 
-// Lock 输出锁定相关的日志
 func Lock(msg string, args ...any) {
 	logger, ok := getLogger()
 	if !ok {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.Lock() -> logger.Info()
-	// 需要跳过 1 层：mlog.Lock()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 
 	if len(args) == 0 {
-		// 无参数情况，直接拼接前缀
 		loggerWithSkip.Info(msg, zap.String("directory", "concurrent"))
 		return
 	}
-	// 有参数情况，使用字符串构建器
 	var sb strings.Builder
-	// 使用更高效的格式化方法
-	if err := formatToStringBuilder(&sb, msg, args...); err != nil {
-		// 格式化失败时的回退策略
-		loggerWithSkip.Info(msg, zap.Error(err), zap.String("directory", "concurrent"))
-		return
-	}
+	formatToStringBuilder(&sb, msg, args...)
 	loggerWithSkip.Info(sb.String(), zap.String("directory", "concurrent"))
 }
 
-// Critical 输出严重错误日志
-// 紧急情况下的警告日志，问题严重，不至于要立刻处理
 func Critical(msg string, args ...any) {
 	logger, ok := getLogger()
 	if !ok {
-		// 避免无限递归，直接 panic 而不调用 ExitGame
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.Critical() -> logger.Warn()
-	// 需要跳过 1 层：mlog.Critical()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 
 	if len(args) == 0 {
-		// 无参数情况，直接拼接前缀
 		loggerWithSkip.Warn(msg, zap.String("directory", "emergency"))
 		return
 	}
-	// 有参数情况，使用字符串构建器
 	var sb strings.Builder
-	if err := formatToStringBuilder(&sb, msg, args...); err != nil {
-		loggerWithSkip.Warn(msg, zap.Error(err), zap.String("directory", "emergency"))
-		return
-	}
+	formatToStringBuilder(&sb, msg, args...)
 	loggerWithSkip.Warn(sb.String(), zap.String("directory", "emergency"))
 }
 
-// Disaster 输出最严重的数据问题日志
-// 紧急情况下的错误日志，问题严重，需要立刻处理
 func Disaster(msg string, args ...interface{}) {
 	logger, ok := getLogger()
 	if !ok {
-		ExitGame("zapLogger 还没有初始化，请先调用 InitialZap")
 		return
 	}
 
-	// 为 mlog 包装函数调用创建带有正确 caller skip 的 logger
-	// 调用栈：用户代码 -> mlog.Disaster() -> logger.Error()
-	// 需要跳过 1 层：mlog.Disaster()
 	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
 
 	if len(args) == 0 {
-		// 无参数情况，直接拼接前缀
 		loggerWithSkip.Error(msg, zap.String("directory", "emergency"))
 		return
 	}
-	// 有参数情况，使用字符串构建器
 	var sb strings.Builder
-	if err := formatToStringBuilder(&sb, msg, args...); err != nil {
-		// 格式化失败时的回退策略
-		loggerWithSkip.Error(msg, zap.Error(err), zap.String("directory", "emergency"))
-		return
-	}
-	loggerWithSkip.Error(sb.String())
+	formatToStringBuilder(&sb, msg, args...)
+	loggerWithSkip.Error(sb.String(), zap.String("directory", "emergency"))
 }
 
-// ExitGame 输出严重错误并退出游戏
 func ExitGame(format string, args ...any) {
 	if !isInitialized() {
 		panic(fmt.Sprintf(format, args...))
 	}
-	// 优化的消息构建
 	var msg string
 	if len(args) == 0 {
 		msg = format
@@ -524,29 +388,23 @@ func ExitGame(format string, args ...any) {
 	}
 
 	if StopFlag() {
-		// 优化：直接构建警告消息，避免额外的格式化
 		Warn("[ExitGame] Has stopped,%s", msg)
 		return
 	}
-	// 优化：直接传递消息，避免额外的格式化
 	Disaster("%s", msg)
-	time.Sleep(3000 * time.Millisecond)
+	_ = Flush()
 	panic(msg)
 }
 
-// GrpcAssert 输出GRPC断言信息（优化版本：保持堆栈信息完整性以支持IDE跳转）
 func GrpcAssert(format string, args ...any) {
-	// 快速预检查，避免不必要的处理
 	if !isInfoEnabledFast() {
 		return
 	}
 
-	// 优化的消息构建
 	_, src, line, _ := runtime.Caller(1)
 
-	// 根据配置决定使用相对路径还是绝对路径
 	displayPath := src
-	if zapConfig.UseRelativePath {
+	if GetConfig().UseRelativePath {
 		displayPath = getRelativePath(src)
 	}
 
@@ -557,22 +415,15 @@ func GrpcAssert(format string, args ...any) {
 		msg = fmt.Sprintf("%s:%d %s", displayPath, line, fmt.Sprintf(format, args...))
 	}
 
-	// 获取堆栈信息
 	buf := debug.Stack()
 	stringStack := BytesToString(buf)
 
-	// 根据配置处理堆栈信息中的路径
-	if zapConfig.UseRelativePath {
+	if GetConfig().UseRelativePath {
 		stringStack = convertStackPathsToRelative(stringStack)
 	}
 
-	// 优化：将堆栈信息作为消息主体，保持完整性以支持IDE跳转
-	// 使用格式化的多行消息，在日志文件中有良好的可读性
 	stackMessage := fmt.Sprintf("[GrpcAssert] %s\n\nStack Trace:\n%s", msg, stringStack)
 
-	// 直接使用 logger 而不是 InfoW，因为我们已经手动获取了调用信息
-	// 调用栈：用户代码 -> mlog.GrpcAssert() -> logger.Info()
-	// 需要跳过 1 层：mlog.GrpcAssert()
 	logger := getLoggerOptimized()
 	if logger != nil {
 		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
@@ -580,19 +431,15 @@ func GrpcAssert(format string, args ...any) {
 	}
 }
 
-// AssertString 输出断言信息（优化版本：保持堆栈信息完整性以支持IDE跳转）
 func AssertString(format string, args ...interface{}) {
-	// 快速预检查，避免不必要的处理
 	if !isInfoEnabledFast() {
 		return
 	}
 
-	// 优化的消息构建
 	_, src, line, _ := runtime.Caller(1)
 
-	// 根据配置决定使用相对路径还是绝对路径
 	displayPath := src
-	if zapConfig.UseRelativePath {
+	if GetConfig().UseRelativePath {
 		displayPath = getRelativePath(src)
 	}
 
@@ -603,22 +450,15 @@ func AssertString(format string, args ...interface{}) {
 		msg = fmt.Sprintf("%s:%d %s", displayPath, line, fmt.Sprintf(format, args...))
 	}
 
-	// 获取堆栈信息
 	buf := debug.Stack()
 	stringStack := BytesToString(buf)
 
-	// 根据配置处理堆栈信息中的路径
-	if zapConfig.UseRelativePath {
+	if GetConfig().UseRelativePath {
 		stringStack = convertStackPathsToRelative(stringStack)
 	}
 
-	// 优化：将堆栈信息作为消息主体，保持完整性以支持IDE跳转
-	// 使用格式化的多行消息，在日志文件中有良好的可读性
 	stackMessage := fmt.Sprintf("[Assert] %s\n\nStack Trace:\n%s", msg, stringStack)
 
-	// 直接使用 logger 而不是 InfoW，因为我们已经手动获取了调用信息
-	// 调用栈：用户代码 -> mlog.AssertString() -> logger.Info()
-	// 需要跳过 1 层：mlog.AssertString()
 	logger := getLoggerOptimized()
 	if logger != nil {
 		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
@@ -626,9 +466,7 @@ func AssertString(format string, args ...interface{}) {
 	}
 }
 
-// BytesToString 将字节数组转换为字符串
 func BytesToString(p []byte) string {
-	// 优化：使用更高效的查找方式
 	for i, b := range p {
 		if b == 0 {
 			return string(p[:i])
@@ -637,68 +475,50 @@ func BytesToString(p []byte) string {
 	return string(p)
 }
 
-// convertStackPathsToRelative 将堆栈信息中的绝对路径转换为相对路径（优化版本）
 func convertStackPathsToRelative(stackTrace string) string {
-	// 如果全局路径缓存可用且有预编译的正则表达式，使用优化版本
-	if globalPathCache != nil && globalPathCache.stackPathRegex != nil {
+	if globalPathCache.Load() != nil {
 		return convertStackPathsToRelativeOptimized(stackTrace)
 	}
 
-	// 回退到原始实现
 	return convertStackPathsToRelativeLegacy(stackTrace)
 }
 
-// convertStackPathsToRelativeOptimized 优化的堆栈路径转换
 func convertStackPathsToRelativeOptimized(stackTrace string) string {
-	// 使用预编译的正则表达式进行批量替换
-	return globalPathCache.stackPathRegex.ReplaceAllStringFunc(stackTrace, func(match string) string {
-		// 提取路径和行号
-		parts := strings.SplitN(match, ":", 2)
-		if len(parts) != 2 {
-			return match
-		}
-
-		filePath := parts[0]
-		lineInfo := parts[1]
-
-		// 使用缓存的路径转换
-		relativePath := getRelativePath(filePath)
-		return relativePath + ":" + lineInfo
+	pc := globalPathCache.Load()
+	if pc == nil {
+		return convertStackPathsToRelativeLegacy(stackTrace)
+	}
+	return pc.stackPathRegex.ReplaceAllStringFunc(stackTrace, func(match string) string {
+		// Use the final colon so a Windows drive prefix is not split as a line number.
+		i := strings.LastIndex(match, ":")
+		return pc.getRelativePathCached(match[:i]) + match[i:]
 	})
 }
 
-// convertStackPathsToRelativeLegacy 原始实现（保持兼容性）
 func convertStackPathsToRelativeLegacy(stackTrace string) string {
 	lines := strings.Split(stackTrace, "\n")
 	for i, line := range lines {
-		// 查找包含文件路径的行（通常以制表符开头，包含文件路径和行号）
 		if strings.Contains(line, "/") && (strings.Contains(line, ".go:") || strings.Contains(line, ".go ")) {
-			// 使用正则表达式或字符串处理来替换路径
 			lines[i] = replaceAbsolutePathInLine(line)
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-// replaceAbsolutePathInLine 替换单行中的绝对路径为相对路径（优化版本）
 func replaceAbsolutePathInLine(line string) string {
-	// 快速检查是否包含需要处理的路径
 	if !strings.Contains(line, "/") || !strings.Contains(line, ".go") {
 		return line
 	}
 
-	// 使用 strings.Builder 减少内存分配
 	var result strings.Builder
-	result.Grow(len(line)) // 预分配容量
+	result.Grow(len(line))
 
-	// 逐字段处理，避免完整分割
 	fields := strings.Fields(line)
 	for i, field := range fields {
 		if i > 0 {
 			result.WriteByte(' ')
 		}
 
-		// 检查是否是路径字段
 		if strings.Contains(field, "/") && strings.Contains(field, ".go") {
 			result.WriteString(replacePathInField(field))
 		} else {
@@ -709,11 +529,8 @@ func replaceAbsolutePathInLine(line string) string {
 	return result.String()
 }
 
-// replacePathInField 替换字段中的路径（优化的辅助函数）
 func replacePathInField(field string) string {
-	// 查找常见的路径分隔符
 	if colonIndex := strings.Index(field, ":"); colonIndex != -1 {
-		// 格式：/path/to/file.go:123
 		filePath := field[:colonIndex]
 		suffix := field[colonIndex:]
 		relativePath := getRelativePath(filePath)
@@ -721,103 +538,62 @@ func replacePathInField(field string) string {
 	}
 
 	if spaceIndex := strings.Index(field, " "); spaceIndex != -1 {
-		// 格式：/path/to/file.go +0x123
 		filePath := field[:spaceIndex]
 		suffix := field[spaceIndex:]
 		relativePath := getRelativePath(filePath)
 		return relativePath + suffix
 	}
 
-	// 只是路径
 	return getRelativePath(field)
 }
 
-// syncLoggerSafely 安全地同步日志器，避免 stdout/stderr 同步错误
 func syncLoggerSafely(logger *zap.Logger) error {
-	// 检查当前配置是否输出到控制台
-	if zapConfig.LogInConsole {
-		// 如果配置为输出到控制台，检查是否为交互式终端
-		if !isInteractiveTerminal() {
-			// 非交互式终端（如重定向、管道、CI环境），跳过同步
-			return nil
-		}
+	err := logger.Sync()
+	if isHarmlessSyncError(err) {
+		return nil
 	}
-
-	// 尝试同步，但忽略特定的错误
-	if err := logger.Sync(); err != nil {
-		// 检查是否为已知的无害错误
-		if isHarmlessSyncError(err) {
-			return nil
-		}
-		return err
-	}
-
-	return nil
+	return err
 }
 
-// isInteractiveTerminal 检查是否为交互式终端
 func isInteractiveTerminal() bool {
-	// 检查 stdout 是否连接到终端
 	if fileInfo, err := os.Stdout.Stat(); err == nil {
-		// 如果是字符设备，通常表示连接到终端
 		return (fileInfo.Mode() & os.ModeCharDevice) != 0
 	}
 	return false
 }
 
-// isHarmlessSyncError 检查是否为无害的同步错误
 func isHarmlessSyncError(err error) bool {
 	if err == nil {
 		return true
 	}
-
-	errStr := err.Error()
-
-	// 常见的无害错误模式
-	harmlessPatterns := []string{
-		"sync /dev/stdout: inappropriate ioctl for device",
-		"sync /dev/stderr: inappropriate ioctl for device",
-		"sync /dev/stdout: invalid argument",
-		"sync /dev/stderr: invalid argument",
-		"sync /dev/stdout: operation not supported",
-		"sync /dev/stderr: operation not supported",
-		"sync /dev/stdout: bad file descriptor",
-		"sync /dev/stderr: bad file descriptor",
-		"inappropriate ioctl",
-		"invalid argument",
-		"bad file descriptor",
-	}
-
-	for _, pattern := range harmlessPatterns {
-		if strings.Contains(errStr, pattern) {
-			return true
+	switch e := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range e.Unwrap() {
+			if !isHarmlessSyncError(child) {
+				return false
+			}
 		}
+		return true
+	case *os.PathError:
+		if e.Op != "sync" {
+			return false
+		}
+		if e.Path != "/dev/stdout" && e.Path != "/dev/stderr" && e.Path != "stdout" && e.Path != "stderr" {
+			return false
+		}
+		return errors.Is(e.Err, syscall.EINVAL) || errors.Is(e.Err, syscall.ENOTTY) || errors.Is(e.Err, syscall.ENOTSUP)
+	case interface{ Unwrap() error }:
+		return isHarmlessSyncError(e.Unwrap())
+	default:
+		return false
 	}
-
-	return false
 }
 
-// StopFlag 检查停止标志
-//
-// 返回值:
-//   - bool: 是否已设置停止标志
-//
-// 功能:
-//   - 线程安全的停止标志检查
-//   - 使用原子操作避免锁竞争
 func StopFlag() bool {
 	return atomic.LoadInt32(&stopFlag) == 1
 }
 
-// SetStopFlag 设置停止标志
-//
-// 功能:
-//   - 线程安全的停止标志设置
-//   - 输出设置日志用于调试
 func SetStopFlag() {
-	// 直接使用 logger 而不是通过 Info() 函数，避免多层调用导致的 caller skip 问题
-	// 调用栈：用户代码 -> mlog.SetStopFlag() -> logger.Info()
-	// 需要跳过 1 层：mlog.SetStopFlag()
 	logger := getLoggerOptimized()
 	if logger != nil {
 		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
@@ -826,27 +602,11 @@ func SetStopFlag() {
 	atomic.StoreInt32(&stopFlag, 1)
 }
 
-// StopNetFlag 检查网络停止标志
-//
-// 返回值:
-//   - bool: 是否已设置网络停止标志
-//
-// 功能:
-//   - 线程安全的网络停止标志检查
-//   - 使用原子操作避免锁竞争
 func StopNetFlag() bool {
 	return atomic.LoadInt32(&stopNetFlag) == 1
 }
 
-// SetStopNetFlag 设置网络停止标志
-//
-// 功能:
-//   - 线程安全的网络停止标志设置
-//   - 输出设置日志用于调试
 func SetStopNetFlag() {
-	// 直接使用 logger 而不是通过 Info() 函数，避免多层调用导致的 caller skip 问题
-	// 调用栈：用户代码 -> mlog.SetStopNetFlag() -> logger.Info()
-	// 需要跳过 1 层：mlog.SetStopNetFlag()
 	logger := getLoggerOptimized()
 	if logger != nil {
 		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))

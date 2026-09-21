@@ -1,0 +1,83 @@
+name: Quality audit
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: quality-audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOMAXPROCS: '4'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.13'
+          cache-dependency-path: |
+            go.sum
+            benchmarks/go.sum
+      - name: Environment
+        run: |
+          mkdir -p audit-results
+          { go version; go env GOOS GOARCH GOMOD; lscpu; git rev-parse HEAD; } > audit-results/environment.txt
+      - name: Exact statement coverage gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          go test -count=1 -timeout=180s -covermode=atomic -coverpkg=./... -coverprofile=audit-results/coverage.out ./... 2>&1 | tee audit-results/test.txt
+          go tool cover -func=audit-results/coverage.out | tee audit-results/coverage.txt
+          python3 scripts/check_coverage.py audit-results/coverage.out | tee audit-results/coverage.json
+      - name: Race and vet gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -timeout=180s ./... 2>&1 | tee audit-results/race.txt
+          go vet ./... 2>&1 | tee audit-results/vet.txt
+          go test -run '^$' -fuzz '^FuzzAuditRouteComponents$' -fuzztime=5s ./ 2>&1 | tee audit-results/fuzz.txt
+      - name: Benchmark correctness gate and comparable measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd benchmarks
+          go test -race -count=1 -run '^TestCompletedOutput$' ./... 2>&1 | tee ../audit-results/benchmark-correctness.txt
+          go test -run '^$' -bench . -benchmem -benchtime=200ms -count=5 -cpu=4 ./... 2>&1 | tee ../audit-results/benchmarks.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-results
+          path: audit-results/
+          retention-days: 14
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: true
+      - name: Current supported toolchain and vulnerability gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p security-results
+          go version | tee security-results/environment.txt
+          go test -race -count=1 -timeout=180s ./... 2>&1 | tee security-results/race.txt
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./... 2>&1 | tee security-results/govulncheck.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-results
+          path: security-results/
+          retention-days: 14

@@ -1,0 +1,12 @@
+--- FAIL: TestAuditSingleFields (0.00s)
+    audit_regression_test.go:3: structured field missing: {"level":"info","time":"2026-09-21 04:29:46.021","message":"audit"}
+         err=<nil>
+--- FAIL: TestAuditWithRouting (0.00s)
+    audit_regression_test.go:4: With directory routing lost: stat /tmp/TestAuditWithRouting543016792/001/orders/info.log: no such file or directory
+create /tmp/TestAuditTraversal3392172333/001/logs directory
+--- FAIL: TestAuditTraversal (0.00s)
+    audit_regression_test.go:5: untrusted route escaped log root
+FAIL
+FAIL	github.com/PinableAgents/mlog	0.009s
+?   	github.com/PinableAgents/mlog/examples	[no test files]
+FAIL
