@@ -2,20 +2,27 @@ name: Quality audit
 on:
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    outputs:
+      audited_sha:
+        description: Exact commit approved by every required gate
+        value: ${{ jobs.gate.outputs.audited_sha }}
 permissions:
   contents: read
+# A called workflow inherits github.workflow; the prefix must differ from Auto Release.
 concurrency:
-  group: quality-audit-${{ github.ref }}
+  group: quality-audit-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      GOMAXPROCS: '4'
+    timeout-minutes: 20
+    outputs:
+      audited_sha: ${{ steps.validated.outputs.audited_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
@@ -23,61 +30,68 @@ jobs:
           cache-dependency-path: |
             go.sum
             benchmarks/go.sum
-      - name: Environment
+      - name: Strict quality checks
+        run: bash scripts/quality_gate.sh "$RUNNER_TEMP/quality-results"
+      - name: Record validated commit
+        id: validated
         run: |
-          mkdir -p audit-results
-          { go version; go env GOOS GOARCH GOMOD; lscpu; git rev-parse HEAD; } > audit-results/environment.txt
-      - name: Exact statement coverage gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m unittest discover -s scripts -p 'test_*.py'
-          go test -count=1 -timeout=180s -covermode=atomic -coverpkg=./... -coverprofile=audit-results/coverage.out ./... 2>&1 | tee audit-results/test.txt
-          go tool cover -func=audit-results/coverage.out | tee audit-results/coverage.txt
-          python3 scripts/check_coverage.py audit-results/coverage.out | tee audit-results/coverage.json
-      - name: Race and vet gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test -race -count=1 -timeout=180s ./... 2>&1 | tee audit-results/race.txt
-          go vet ./... 2>&1 | tee audit-results/vet.txt
-          go test -run '^$' -fuzz '^FuzzAuditRouteComponents$' -fuzztime=5s ./ 2>&1 | tee audit-results/fuzz.txt
-      - name: Benchmark correctness gate and comparable measurements
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd benchmarks
-          go test -race -count=1 ./... 2>&1 | tee ../audit-results/benchmark-correctness.txt
-          go test -run '^$' -bench . -benchmem -benchtime=200ms -count=5 -cpu=4 ./... 2>&1 | tee ../audit-results/benchmarks.txt
+          test "$(cat "$RUNNER_TEMP/quality-results/validated-sha.txt")" = "$GITHUB_SHA"
+          echo "audited_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: quality-results
-          path: audit-results/
+          path: ${{ runner.temp }}/quality-results/
           retention-days: 14
+          if-no-files-found: error
   security:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    outputs:
+      audited_sha: ${{ steps.validated.outputs.audited_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
           cache: true
-      - name: Current supported toolchain and vulnerability gate
-        shell: bash
+      - name: Validate workflow syntax
         run: |
           set -euo pipefail
-          mkdir -p security-results
-          go version | tee security-results/environment.txt
-          go test -race -count=1 -timeout=180s ./... 2>&1 | tee security-results/race.txt
-          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
-          govulncheck ./... 2>&1 | tee security-results/govulncheck.txt
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          "$(go env GOPATH)/bin/actionlint" -shellcheck=
+      - name: Supported toolchain and vulnerability checks
+        run: bash scripts/security_gate.sh "$RUNNER_TEMP/security-results"
+      - name: Record validated commit
+        id: validated
+        run: |
+          test "$(cat "$RUNNER_TEMP/security-results/validated-sha.txt")" = "$GITHUB_SHA"
+          echo "audited_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: security-results
-          path: security-results/
+          path: ${{ runner.temp }}/security-results/*.txt
           retention-days: 14
+          if-no-files-found: error
+  gate:
+    name: Strict quality gate
+    needs: [quality, security]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      audited_sha: ${{ steps.verdict.outputs.audited_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require both successes for this exact commit
+        id: verdict
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/require_quality.py

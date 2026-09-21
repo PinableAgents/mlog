@@ -180,57 +180,26 @@ is_auto_increment() {
 
 # 运行测试
 run_tests() {
-    log_info "运行测试..."
-
-    # 检查是否有测试文件
-    local has_tests=false
-    if find . -name "*_test.go" -type f | grep -q .; then
-        has_tests=true
-    fi
-
-    if [[ "$has_tests" == "true" ]]; then
-        # 运行测试并捕获输出
-        if ! go test -v ./... 2>&1; then
-            log_error "测试失败，请修复后重试"
-            log_info "提示: 可以运行 'go test -v ./...' 查看详细错误信息"
-            exit 1
-        fi
-        log_success "所有测试通过"
-    else
-        log_warning "未发现测试文件，跳过测试步骤"
-        log_info "建议为项目添加单元测试以提高代码质量"
-    fi
+    log_info "运行完整质量门禁（不提供跳过选项）..."
+    local gate_dir
+    gate_dir=$(mktemp -d "${TMPDIR:-/tmp}/mlog-release.XXXXXX")
+    log_info "质量检查证据: $gate_dir"
+    GOTOOLCHAIN=go1.24.13 bash scripts/quality_gate.sh "$gate_dir/quality"
+    GOTOOLCHAIN=go1.27.1 bash scripts/security_gate.sh "$gate_dir/security"
+    RELEASE_VALIDATED_SHA=$(git rev-parse HEAD)
+    test "$(cat "$gate_dir/quality/validated-sha.txt")" = "$RELEASE_VALIDATED_SHA"
+    test "$(cat "$gate_dir/security/validated-sha.txt")" = "$RELEASE_VALIDATED_SHA"
 }
 
 # 运行代码检查
 run_lint() {
-    log_info "运行代码检查..."
-
-    # 检查 go fmt
-    local unformatted_files=$(gofmt -l .)
+    local unformatted_files
+    unformatted_files=$(gofmt -l .)
     if [[ -n "$unformatted_files" ]]; then
-        log_warning "发现格式不规范的文件，正在自动格式化..."
-        echo "$unformatted_files"
-        go fmt ./...
-        log_success "代码格式化完成"
-
-        # 如果有格式化的文件，需要重新检查工作目录状态
-        if ! git diff-index --quiet HEAD --; then
-            log_info "代码格式化产生了更改，将自动提交"
-            git add .
-            git commit -m "style: 自动格式化代码"
-        fi
-    else
-        log_success "代码格式检查通过"
-    fi
-
-    # 检查 go vet
-    if ! go vet ./...; then
-        log_error "代码静态检查失败，请修复后重试"
+        log_error "代码格式不规范，请修复并提交后重试（发布流程不会自动修改代码）"
+        printf '%s\n' "$unformatted_files"
         exit 1
     fi
-
-    log_success "代码静态检查通过"
 }
 
 # 更新版本信息
@@ -260,7 +229,7 @@ update_version_info() {
 }
 
 # 生成变更日志
-generate_changelog() {
+ generate_changelog() {
     local version=$1
     local message=$2
     local latest_version=$(get_latest_version)
@@ -294,37 +263,17 @@ generate_changelog() {
 create_release() {
     local version=$1
     local message=$2
-    local current_branch=$(git branch --show-current)
-
-    log_info "创建 Git 标签 $version..."
-
-    # 创建带注释的标签
-    git tag -a "$version" -m "$message"
-    log_success "标签 $version 创建成功"
-
-    # 检查是否有远程仓库
+    local current_branch
+    current_branch=$(git branch --show-current)
+    test -n "${RELEASE_VALIDATED_SHA:-}"
+    test "$(git rev-parse HEAD)" = "$RELEASE_VALIDATED_SHA"
+    git diff --exit-code HEAD --
+    git tag -a "$version" "$RELEASE_VALIDATED_SHA" -m "$message"
     if git remote | grep -q .; then
-        # 推送代码到远程仓库（如果有未推送的提交）
-        if ! git diff --quiet HEAD "origin/$current_branch" 2>/dev/null; then
-            log_info "推送代码到远程仓库..."
-            if git push origin "$current_branch"; then
-                log_success "代码已推送到远程仓库"
-            else
-                log_warning "代码推送失败，但标签已创建"
-            fi
-        fi
-
-        # 推送标签到远程仓库
-        log_info "推送标签到远程仓库..."
-        if git push origin "$version"; then
-            log_success "标签已推送到远程仓库"
-        else
-            log_error "标签推送失败"
-            log_info "可以稍后手动推送: git push origin $version"
-        fi
+        # Never publish a tag if updating its branch fails.
+        git push --atomic origin "HEAD:refs/heads/$current_branch" "refs/tags/$version"
     else
-        log_warning "未配置远程仓库，标签仅在本地创建"
-        log_info "如需推送到远程，请先配置远程仓库"
+        log_warning "未配置远程仓库，经过完整验证的标签仅在本地创建"
     fi
 }
 
@@ -453,8 +402,7 @@ main() {
     check_main_branch
     check_version_exists "$version"
 
-    # 运行测试和代码检查
-    run_tests
+    # 只检查格式，不在测试后偷偷改写源码
     run_lint
 
     # 更新版本信息
@@ -465,6 +413,9 @@ main() {
         log_info "提交版本信息更新..."
         git commit -m "chore: bump version to $version"
     fi
+
+    # 在版本变更提交之后验证最终待发布内容；失败不创建或推送标签
+    run_tests
 
     # 生成变更日志
     generate_changelog "$version" "$message"

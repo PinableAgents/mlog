@@ -1,221 +1,49 @@
-# GitHub Actions 自动发布工作流
+# mlog 自动发布与严格质量门禁
 
-## 概述
+自动发布入口为 `release.yml`。它只接受 `main` / `master` 的 push，保留仅文档修改的忽略规则、`[skip release]` / `[no release]` 标记和版本提交循环保护。
 
-本项目配置了自动发布工作流，当代码推送到主分支（`main` 或 `master`）时，会自动执行打包发布流程。
+## 依赖链
 
-## 工作流程
-
-1. **代码推送触发**：当代码推送到主分支时自动触发
-2. **环境检查**：检查 Go 环境和依赖
-3. **测试运行**：自动运行所有测试
-4. **代码检查**：执行代码格式化和静态检查
-5. **版本计算**：根据 commit 信息自动确定版本号
-6. **版本更新**：更新 `version.go` 和 `README.md` 中的版本信息
-7. **创建标签**：创建 Git 标签并推送
-8. **发布 Release**：在 GitHub 上创建正式发布
-
-## 版本号规则
-
-工作流会根据 commit 信息自动确定版本类型：
-
-### 主版本号递增（Major）
-当 commit 信息包含以下内容时：
-- `feat!:` 或 `feature!:` - 带有破坏性变更的新功能
-- `BREAKING CHANGE:` - 明确标注的破坏性变更
-- 包含 `breaking change` 关键词
-
-**示例**：
-```bash
-git commit -m "feat!: 重构核心 API，不兼容旧版本"
-git commit -m "BREAKING CHANGE: 修改日志接口签名"
+```text
+preflight（只读，检查是否需要发布）
+  └─ audit（只读，调用同一提交的 quality-audit.yml）
+       ├─ quality：格式、脚本测试、依赖校验、精确100%覆盖、race、vet、fuzz、基准正确性与基准运行
+       ├─ security：工作流语法、受支持Go的race、govulncheck
+       └─ gate：两个结果均success，且两个audited_sha均等于触发SHA
+            └─ release（唯一contents:write作业）
+                 ├─ 检查主分支没有前进；只在本地更新版本并创建候选提交
+                 ├─ 候选提交完整重跑quality + security
+                 ├─ 保存候选验证证据；检查SHA和工作区、再次检查远端分支
+                 ├─ 原子推送候选提交和标签（无强推）
+                 └─ 使用已存在的标签创建GitHub Release
 ```
 
-### 次版本号递增（Minor）
-当 commit 信息以以下前缀开头时：
-- `feat:` 或 `feature:` - 新功能
+`quality-audit.yml` 同时提供 PR、只读手动触发和 `workflow_call`。无需独立添加 push 检查：Auto Release 本身调用它，并通过 `needs` 与明确的成功条件阻断发布，不是与检查并行启动。
 
-**示例**：
-```bash
-git commit -m "feat: 添加异步日志支持"
-git commit -m "feature: 新增配置热加载功能"
-```
+检查失败、取消、跳过、缺少结果、引用其他提交的成功结果、工具安装失败或漏洞库访问失败都不能放行。`always()` 仅用于汇总和保存证据，不用于发布。不存在 `continue-on-error` 或跳过质量检查的输入。
 
-### 补丁版本号递增（Patch）
-其他所有类型的 commit：
-- `fix:` - Bug 修复
-- `docs:` - 文档更新
-- `style:` - 代码格式化
-- `refactor:` - 代码重构
-- `perf:` - 性能优化
-- `test:` - 测试相关
-- `chore:` - 构建/工具相关
+## 为什么检查两次
 
-**示例**：
-```bash
-git commit -m "fix: 修复日志级别判断错误"
-git commit -m "docs: 更新 API 文档"
-git commit -m "perf: 优化日志写入性能"
-```
+第一次检查实际触发提交；原流程随后会修改 `version.go`。为防止“测A发B”，第二次针对本地版本候选提交完整执行相同脚本，成功后才允许将该候选提交和标签推送到远端。发布流程不会运行自动格式化、自动修复依赖或修改其他生产代码。
 
-## 跳过自动发布
+门禁脚本分别为 `scripts/quality_gate.sh` 和 `scripts/security_gate.sh`。根模块Go兼容基线保持1.24，检查使用Go1.24.13；安全检查使用Go1.27.1和govulncheck1.8.0。更新工具链时同时调整质量工作流、发布候选工作流和手动入口的固定版本。
 
-如果某次提交不需要触发发布，可以在 commit 信息中添加以下标记：
+## 版本与兼容
 
-```bash
-git commit -m "docs: 更新文档 [skip release]"
-git commit -m "chore: 更新依赖 [no release]"
-```
-
-## 首次发布
-
-首次发布时，版本号将根据 commit 类型自动确定：
-- 主版本更新 → `v1.0.0`
-- 次版本更新 → `v0.1.0`
-- 补丁更新 → `v0.0.1`
+保留原有版本策略：`feat!` / `feature!` / `BREAKING CHANGE` 为major，普通feat/feature为minor，其余为patch。自动递增只使用正式的 `vX.Y.Z` 标签；首次分别为v1.0.0 / v0.1.0 / v0.0.1。不改变mlog的公开API、配置、Zap依赖或运行时行为。
 
 ## 手动发布
 
-如果需要手动控制发布，仍然可以使用原有的 `release.sh` 脚本：
+`./release.sh init "修复说明"`、`minor`、`major`、显式版本号等原入口保留。手动脚本在版本变更提交之后也调用两套完整门禁；确认发布前后验证候选SHA和工作区，推送分支及标签时使用 `git push --atomic`，推送失败会返回非零，不会再报告成功。
 
-```bash
-# 自动递增补丁版本
-./release.sh init "修复bug"
+此脚本需要Bash、Git、Python3、Go、C编译器（race）及下载固定Go工具链/扫描器的网络。缺少工具或网络故障即停止；不要通过删测试或改覆盖率门槛来绕过。
 
-# 自动递增次版本
-./release.sh minor "新增功能"
+## 证据与失败恢复
 
-# 自动递增主版本
-./release.sh major "重大更新"
+Actions保存 `quality-results`、`security-results`、`release-candidate-evidence`（14天）。其中包含覆盖率原始文件、精确计数、race/vet/fuzz、基准输出、扫描结果和经过验证的SHA。
 
-# 手动指定版本
-./release.sh v1.2.3 "自定义版本发布"
-```
+若源分支在检查期间前进，旧候选不发布；让新提交触发流程。若分支或标签冲突，原子推送失败，不强推、不覆盖已发布标签。若标签已推送而GitHub Release API失败，已推送的标签仍是经过验证的候选；核对原运行证据和标签SHA后，只补建该标签的Release。不要删除重打标签，也不要用新main伪装成同一版本。
 
-## 工作流配置
+这约束仓库自带的自动与手动发布路径，不是管理员无法绕过的权限隔离。拥有写权限的人仍可能直接git push标签/API创建Release；需要组织级禁止绕过时，应另配GitHub标签ruleset、分支保护和发布环境审批。当前改动不擅自修改仓库管理员权限。
 
-### 触发条件
-- 推送到 `main` 或 `master` 分支
-- 忽略以下文件的变更：
-  - Markdown 文件（`**.md`）
-  - `.gitignore`
-  - `LICENSE`
-
-### 权限要求
-工作流需要 `contents: write` 权限来创建标签和发布。
-
-### 环境要求
-- Ubuntu 最新版本
-- Go 版本从 `go.mod` 文件自动读取
-
-## 发布产物
-
-每次成功发布后，会生成：
-
-1. **Git 标签**：格式为 `vX.Y.Z`
-2. **GitHub Release**：包含变更日志和提交记录
-3. **更新的版本文件**：
-   - `version.go`（如果存在）
-   - `README.md`（如果包含 `go get` 命令）
-
-## 最佳实践
-
-### 1. 使用语义化提交信息
-遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范：
-
-```
-<type>[optional scope]: <description>
-
-[optional body]
-
-[optional footer(s)]
-```
-
-### 2. 合理使用版本类型
-- **Patch（补丁）**：向后兼容的 bug 修复
-- **Minor（次版本）**：向后兼容的新功能
-- **Major（主版本）**：不兼容的 API 变更
-
-### 3. 编写清晰的提交信息
-提交信息会被包含在发布说明中，应该：
-- 简洁明了
-- 描述变更内容
-- 说明变更原因（如果必要）
-
-### 4. 确保测试通过
-工作流会自动运行测试，确保：
-- 所有测试用例通过
-- 代码格式符合规范
-- 静态检查无错误
-
-## 故障排查
-
-### 发布失败
-如果自动发布失败，检查：
-1. GitHub Actions 日志中的错误信息
-2. 测试是否全部通过
-3. 代码格式是否规范
-4. 是否有权限问题
-
-### 版本冲突
-如果出现版本号冲突：
-1. 检查是否有未推送的标签
-2. 手动删除冲突的标签：`git tag -d vX.Y.Z`
-3. 重新推送代码触发发布
-
-### 跳过发布未生效
-确保在 commit 信息中正确添加了跳过标记：
-- `[skip release]`
-- `[no release]`
-- `[skip-release]`
-- `[no-release]`
-
-## 示例工作流
-
-### 场景 1：修复 Bug
-```bash
-# 修复代码
-git add .
-git commit -m "fix: 修复日志文件锁定问题"
-git push origin main
-
-# 自动触发发布，版本号从 v1.2.3 → v1.2.4
-```
-
-### 场景 2：添加新功能
-```bash
-# 开发新功能
-git add .
-git commit -m "feat: 添加日志轮转功能"
-git push origin main
-
-# 自动触发发布，版本号从 v1.2.4 → v1.3.0
-```
-
-### 场景 3：重大更新
-```bash
-# 重构 API
-git add .
-git commit -m "feat!: 重构日志接口，简化使用方式
-
-BREAKING CHANGE: Logger.Write() 方法签名已更改"
-git push origin main
-
-# 自动触发发布，版本号从 v1.3.0 → v2.0.0
-```
-
-### 场景 4：仅更新文档
-```bash
-# 更新文档
-git add .
-git commit -m "docs: 更新 API 使用示例 [skip release]"
-git push origin main
-
-# 不会触发发布
-```
-
-## 相关链接
-
-- [GitHub Actions 文档](https://docs.github.com/en/actions)
-- [语义化版本规范](https://semver.org/lang/zh-CN/)
-- [Conventional Commits](https://www.conventionalcommits.org/)
+官方机制说明：https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows
