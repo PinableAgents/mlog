@@ -1,0 +1,56 @@
+goos: linux
+goarch: amd64
+pkg: github.com/PinableAgents/mlog/benchmarks
+cpu: INTEL(R) XEON(R) PLATINUM 8573C
+BenchmarkFileParallel/mlog-sync-4         	  113776	      2143 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFileParallel/mlog-sync-4         	  125236	      2094 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFileParallel/mlog-sync-4         	  114670	      2120 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFileParallel/mlog-sync-4         	  114667	      2072 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFileParallel/mlog-sync-4         	  102184	      2183 ns/op	     168 B/op	       3 allocs/op
+BenchmarkFileParallel/mlog-async-drained-4         	   97525	      2529 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFileParallel/mlog-async-drained-4         	  119234	      2380 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFileParallel/mlog-async-drained-4         	   84651	      2416 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFileParallel/mlog-async-drained-4         	  109717	      2396 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFileParallel/mlog-async-drained-4         	  103728	      2526 ns/op	    1288 B/op	       7 allocs/op
+BenchmarkFileParallel/zap-4                        	  124856	      1857 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFileParallel/zap-4                        	  129567	      1869 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFileParallel/zap-4                        	  139884	      2098 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFileParallel/zap-4                        	  114979	      1842 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFileParallel/zap-4                        	  120937	      1921 ns/op	      24 B/op	       1 allocs/op
+BenchmarkFileParallel/slog-4                       	   84848	      2834 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFileParallel/slog-4                       	   91131	      2811 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFileParallel/slog-4                       	   91306	      2735 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFileParallel/slog-4                       	   87564	      3159 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFileParallel/slog-4                       	   86601	      2669 ns/op	      48 B/op	       4 allocs/op
+BenchmarkFileParallel/zerolog-4                    	  137877	      1472 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileParallel/zerolog-4                    	  184820	      1371 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileParallel/zerolog-4                    	  197437	      1421 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileParallel/zerolog-4                    	  160028	      1324 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileParallel/zerolog-4                    	  166872	      1469 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFileParallel/logrus-4                     	   31720	      6818 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkFileParallel/logrus-4                     	   29656	      6841 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkFileParallel/logrus-4                     	   36964	      7003 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkFileParallel/logrus-4                     	   32954	      7071 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkFileParallel/logrus-4                     	   35268	      6712 ns/op	    2282 B/op	      35 allocs/op
+BenchmarkNativeDiscard/zap-4                       	  494358	       511.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zap-4                       	  482559	       463.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zap-4                       	  448711	       481.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zap-4                       	  498488	       495.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zap-4                       	  495153	       498.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/slog-4                      	  171518	      1498 ns/op	     120 B/op	       3 allocs/op
+BenchmarkNativeDiscard/slog-4                      	  145167	      1506 ns/op	     120 B/op	       3 allocs/op
+BenchmarkNativeDiscard/slog-4                      	  168946	      1471 ns/op	     120 B/op	       3 allocs/op
+BenchmarkNativeDiscard/slog-4                      	  139862	      1473 ns/op	     120 B/op	       3 allocs/op
+BenchmarkNativeDiscard/slog-4                      	  165795	      1433 ns/op	     120 B/op	       3 allocs/op
+BenchmarkNativeDiscard/zerolog-4                   	 1000000	       208.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zerolog-4                   	 1220012	       214.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zerolog-4                   	 1000000	       201.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zerolog-4                   	 1000000	       204.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/zerolog-4                   	 1215090	       201.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNativeDiscard/logrus-4                    	   53829	      3851 ns/op	    2177 B/op	      31 allocs/op
+BenchmarkNativeDiscard/logrus-4                    	   63103	      3850 ns/op	    2177 B/op	      31 allocs/op
+BenchmarkNativeDiscard/logrus-4                    	   57944	      3774 ns/op	    2177 B/op	      31 allocs/op
+BenchmarkNativeDiscard/logrus-4                    	   55028	      3780 ns/op	    2177 B/op	      31 allocs/op
+BenchmarkNativeDiscard/logrus-4                    	   63031	      3992 ns/op	    2177 B/op	      31 allocs/op
+PASS
+ok  	github.com/PinableAgents/mlog/benchmarks	14.176s
