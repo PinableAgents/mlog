@@ -1,0 +1,74 @@
+name: Quality audit
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: quality-audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+      - name: Record environment and resolve dependencies
+        run: |
+          mkdir -p audit-results
+          { go version; go env GOOS GOARCH GOMOD GOTOOLCHAIN; uname -a; lscpu; git rev-parse HEAD; } > audit-results/environment.txt
+          go mod download all
+          go list -m all > audit-results/modules.txt
+      - name: Baseline tests and coverage
+        id: coverage
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout=120s -covermode=atomic -coverpkg=./... -coverprofile=audit-results/coverage.out ./... 2>&1 | tee audit-results/test.txt
+          go tool cover -func=audit-results/coverage.out | tee audit-results/coverage.txt
+      - name: Baseline race detector
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=120s ./... 2>&1 | tee audit-results/race.txt
+      - name: Vet
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          go vet ./... 2>&1 | tee audit-results/vet.txt
+      - name: Export reproducible offline audit environment
+        if: always()
+        run: |
+          set -eu
+          mkdir -p /tmp/mlog-comparison
+          cd /tmp/mlog-comparison
+          go mod init example.com/mlog-comparison
+          go get github.com/rs/zerolog@v1.34.0 github.com/sirupsen/logrus@v1.9.4
+          go mod download all
+          cd "$GITHUB_WORKSPACE"
+          tar --exclude=.git --exclude=audit-results -czf /tmp/mlog-source.tar.gz .
+          tar -C "$(dirname "$(go env GOROOT)")" -czf /tmp/mlog-toolchain.tar.gz "$(basename "$(go env GOROOT)")"
+          tar -C "$(go env GOPATH)/pkg" -czf /tmp/mlog-modcache.tar.gz mod
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-baseline
+          path: audit-results/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-workbench
+          path: |
+            /tmp/mlog-source.tar.gz
+            /tmp/mlog-toolchain.tar.gz
+            /tmp/mlog-modcache.tar.gz
+          compression-level: 0
+          retention-days: 2
