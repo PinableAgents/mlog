@@ -13,9 +13,7 @@ import (
 func TestAuditAsyncContracts(t *testing.T) {
 	_, logs := auditObserve(t)
 	al := newAsyncLogger(4, false)
-	asyncMutex.Lock()
-	globalAsyncLogger = al
-	asyncMutex.Unlock()
+	globalAsyncLogger.Store(al)
 	t.Cleanup(func() { Close() })
 	Debug("printf %d", 1)
 	Info("printf %d", 2)
@@ -195,9 +193,7 @@ func TestAuditAsyncCallerAndTimestamp(t *testing.T) {
 	zapConfig = *cfg
 	globalMutex.Unlock()
 	al := newAsyncLogger(2, false)
-	asyncMutex.Lock()
-	globalAsyncLogger = al
-	asyncMutex.Unlock()
+	globalAsyncLogger.Store(al)
 	before := time.Now()
 	Info("caller printf")
 	InfoW("caller fields")

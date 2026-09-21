@@ -22,6 +22,7 @@ var (
 	atomicLevel       = zap.NewAtomicLevelAt(zapcore.InfoLevel)
 	initialized       int32
 	loggerPtr         atomic.Pointer[zap.Logger]
+	callerVariantsPtr atomic.Pointer[callerVariants]
 	debugEnabledCache int32
 	infoEnabledCache  int32
 	warnEnabledCache  int32
@@ -87,15 +88,14 @@ func InitialZapChecked(name string, id uint64, logLevel string, zc *ZapConfig) e
 	if err != nil {
 		return err
 	}
+	callerVariantsPtr.Store(&callerVariants{base: logger, skip1: logger.WithOptions(zap.AddCallerSkip(1)), skip2: logger.WithOptions(zap.AddCallerSkip(2))})
 	loggerPtr.Store(logger)
 	zapLogger = logger
 	zap.ReplaceGlobals(logger)
 	atomic.StoreInt32(&initialized, 1)
 	updateLevelCacheOptimized(level)
 	if cfg.EnableAsync {
-		asyncMutex.Lock()
-		globalAsyncLogger = newAsyncLoggerFor(cfg.AsyncBufferSize, cfg.AsyncDropOnFull, logger, cfg.ShowLine)
-		asyncMutex.Unlock()
+		globalAsyncLogger.Store(newAsyncLoggerFor(cfg.AsyncBufferSize, cfg.AsyncDropOnFull, logger, cfg.ShowLine))
 	}
 	if cfg.UseRelativePath {
 		initPathCache()
@@ -187,16 +187,14 @@ func Close() { globalMutex.Lock(); defer globalMutex.Unlock(); closeLocked() }
 
 func closeLocked() {
 	// Detach the queue first. Workers hold a logger from their own generation.
-	asyncMutex.Lock()
-	old := globalAsyncLogger
-	globalAsyncLogger = nil
-	asyncMutex.Unlock()
+	old := globalAsyncLogger.Swap(nil)
 	if old != nil {
 		old.Close()
 	}
 	atomic.StoreInt32(&initialized, 0)
 	updateLevelCacheOptimized(zapcore.FatalLevel)
 	loggerPtr.Store(nil)
+	callerVariantsPtr.Store(nil)
 	coreMutex.Lock()
 	for _, core := range zapCores {
 		if err := core.Close(); err != nil {
@@ -235,8 +233,9 @@ func DebugW(msg string, fields ...zap.Field) {
 	if !isDebugEnabledFast() {
 		return
 	}
-	if isAsyncEnabled() {
-		debugAsync(msg, nil, fields...)
+	if al, enabled := getAsyncLogger(); enabled {
+		// One queue lookup, with the same public call-site caller depth.
+		al.logAsyncWithSkip(zapcore.DebugLevel, msg, nil, 2, fields...)
 		return
 	}
 	logger := getLoggerOptimized()
@@ -244,7 +243,7 @@ func DebugW(msg string, fields ...zap.Field) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 	loggerWithSkip.Debug(msg, fields...)
 }
 
@@ -259,8 +258,9 @@ func InfoW(msg string, fields ...zap.Field) {
 	if !isInfoEnabledFast() {
 		return
 	}
-	if isAsyncEnabled() {
-		infoAsync(msg, nil, fields...)
+	if al, enabled := getAsyncLogger(); enabled {
+		// One queue lookup, with the same public call-site caller depth.
+		al.logAsyncWithSkip(zapcore.InfoLevel, msg, nil, 2, fields...)
 		return
 	}
 	logger := getLoggerOptimized()
@@ -268,7 +268,7 @@ func InfoW(msg string, fields ...zap.Field) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 	loggerWithSkip.Info(msg, fields...)
 }
 
@@ -283,8 +283,9 @@ func WarnW(msg string, fields ...zap.Field) {
 	if !isWarnEnabledFast() {
 		return
 	}
-	if isAsyncEnabled() {
-		warnAsync(msg, nil, fields...)
+	if al, enabled := getAsyncLogger(); enabled {
+		// One queue lookup, with the same public call-site caller depth.
+		al.logAsyncWithSkip(zapcore.WarnLevel, msg, nil, 2, fields...)
 		return
 	}
 	logger := getLoggerOptimized()
@@ -292,7 +293,7 @@ func WarnW(msg string, fields ...zap.Field) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 	loggerWithSkip.Warn(msg, fields...)
 }
 
@@ -308,8 +309,9 @@ func ErrorW(msg string, fields ...zap.Field) {
 		return
 	}
 
-	if isAsyncEnabled() {
-		errorAsync(msg, nil, fields...)
+	if al, enabled := getAsyncLogger(); enabled {
+		// One queue lookup, with the same public call-site caller depth.
+		al.logAsyncWithSkip(zapcore.ErrorLevel, msg, nil, 2, fields...)
 		return
 	}
 	logger := getLoggerOptimized()
@@ -317,7 +319,7 @@ func ErrorW(msg string, fields ...zap.Field) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 	loggerWithSkip.Error(msg, fields...)
 }
 
@@ -331,7 +333,7 @@ func Lock(msg string, args ...any) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 
 	if len(args) == 0 {
 		loggerWithSkip.Info(msg, zap.String("directory", "concurrent"))
@@ -348,7 +350,7 @@ func Critical(msg string, args ...any) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 
 	if len(args) == 0 {
 		loggerWithSkip.Warn(msg, zap.String("directory", "emergency"))
@@ -365,7 +367,7 @@ func Disaster(msg string, args ...interface{}) {
 		return
 	}
 
-	loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+	loggerWithSkip := withCachedCallerSkip(logger, 1)
 
 	if len(args) == 0 {
 		loggerWithSkip.Error(msg, zap.String("directory", "emergency"))
@@ -426,7 +428,7 @@ func GrpcAssert(format string, args ...any) {
 
 	logger := getLoggerOptimized()
 	if logger != nil {
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+		loggerWithSkip := withCachedCallerSkip(logger, 1)
 		loggerWithSkip.Info(stackMessage, zap.String("directory", "assert"))
 	}
 }
@@ -461,7 +463,7 @@ func AssertString(format string, args ...interface{}) {
 
 	logger := getLoggerOptimized()
 	if logger != nil {
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+		loggerWithSkip := withCachedCallerSkip(logger, 1)
 		loggerWithSkip.Info(stackMessage, zap.String("directory", "assert"))
 	}
 }
@@ -596,7 +598,7 @@ func StopFlag() bool {
 func SetStopFlag() {
 	logger := getLoggerOptimized()
 	if logger != nil {
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+		loggerWithSkip := withCachedCallerSkip(logger, 1)
 		loggerWithSkip.Info("[SetStopFlag] start")
 	}
 	atomic.StoreInt32(&stopFlag, 1)
@@ -609,8 +611,27 @@ func StopNetFlag() bool {
 func SetStopNetFlag() {
 	logger := getLoggerOptimized()
 	if logger != nil {
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(1))
+		loggerWithSkip := withCachedCallerSkip(logger, 1)
 		loggerWithSkip.Info("[SetStopNetFlag] start")
 	}
 	atomic.StoreInt32(&stopNetFlag, 1)
+}
+
+// callerVariants is immutable after publication. Base identity prevents a
+// stale generation from borrowing caller options from the replacement logger.
+type callerVariants struct {
+	base, skip1, skip2 *zap.Logger
+}
+
+func withCachedCallerSkip(logger *zap.Logger, skip int) *zap.Logger {
+	if v := callerVariantsPtr.Load(); v != nil && v.base == logger {
+		if skip == 1 {
+			return v.skip1
+		}
+		if skip == 2 {
+			return v.skip2
+		}
+	}
+	// Custom/internal test loggers and lifecycle races retain legacy behavior.
+	return logger.WithOptions(zap.AddCallerSkip(skip))
 }

@@ -31,6 +31,7 @@ type ZapCore struct {
 	encoder             zapcore.Encoder
 	lumberjackLogger    io.WriteCloser
 	specialLoggers      map[string]io.WriteCloser
+	routeSyncers        sync.Map // route -> validated sink; same bounded writer registry
 	mu                  sync.RWMutex
 	specialLoggersMutex sync.Mutex
 	closed              bool
@@ -249,15 +250,23 @@ func (z *ZapCore) routeFields(fields []zapcore.Field) (string, []zapcore.Field, 
 	if z.config.SingleFile {
 		return "", fields, nil
 	}
-	filtered := make([]zapcore.Field, 0, len(fields))
+	// Most records have no routing fields. Reuse the caller's read-only slice
+	// in that case; copy only when stripping a routing control field.
+	filtered := fields
+	copied := false
 	route := ""
-	for _, f := range fields {
+	for i, f := range fields {
 		if f.Key == "business" || f.Key == "folder" || f.Key == "directory" {
 			if f.Type != zapcore.StringType {
 				return "", nil, errors.New("mlog: route must be a string")
 			}
+			if !copied {
+				filtered = make([]zapcore.Field, 0, len(fields)-1)
+				filtered = append(filtered, fields[:i]...)
+				copied = true
+			}
 			route = f.String
-		} else {
+		} else if copied {
 			filtered = append(filtered, f)
 		}
 	}
@@ -283,9 +292,31 @@ func (z *ZapCore) writeEncoded(core zapcore.Core, enc zapcore.Encoder, route str
 		route = current
 	}
 	if route != "" {
-		return zapcore.NewCore(enc, z.createWriteSyncer(z.serviceName, z.serviceID, route), z.level).Write(e, filtered)
+		return zapcore.NewCore(enc, z.routeWriteSyncer(route), z.level).Write(e, filtered)
 	}
 	return core.Write(e, filtered)
+}
+
+// routeWriteSyncer is called with mu held, so a cache hit cannot resurrect a
+// closed generation. Only successful sink construction is cached; validation,
+// filesystem failures and capacity failures still go through the original path.
+func (z *ZapCore) routeWriteSyncer(route string) zapcore.WriteSyncer {
+	// Preserve the existing behavior of resolving os.Stdout on each routed
+	// console write. Do not capture a replaced/redirected stdout in this cache.
+	if z.config.LogInConsole {
+		return z.createWriteSyncer(z.serviceName, z.serviceID, route)
+	}
+	if cached, ok := z.routeSyncers.Load(route); ok {
+		return cached.(zapcore.WriteSyncer)
+	}
+	writer := z.createWriteSyncer(z.serviceName, z.serviceID, route)
+	if _, failed := writer.(errorSyncer); failed {
+		return writer
+	}
+	// createWriteSyncer serializes creation and enforces MaxRouteWriters.
+	// Concurrent misses may build wrappers, but never a second file writer.
+	actual, _ := z.routeSyncers.LoadOrStore(route, writer)
+	return actual.(zapcore.WriteSyncer)
 }
 
 func (z *ZapCore) Sync() error {
@@ -321,5 +352,6 @@ func (z *ZapCore) Close() error {
 		errs = append(errs, w.Close())
 	}
 	z.specialLoggers = nil
+	z.routeSyncers.Clear()
 	return errors.Join(errs...)
 }

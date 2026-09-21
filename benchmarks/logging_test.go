@@ -30,6 +30,7 @@ var attrs = []slog.Attr{slog.String("request_id", "req-123"), slog.Int("user_id"
 var names = []string{"mlog-sync", "mlog-async-drained", "zap", "slog", "zerolog", "logrus"}
 
 type subject struct {
+	inlineStructured                       func()
 	plain, structured, disabled, formatted func()
 	finish                                 func()
 	path                                   string
@@ -52,6 +53,9 @@ func newSubject(t testing.TB, name string) *subject {
 		mlog.InitialZap("", 0, "info", &cfg)
 		s.plain = func() { mlog.Info("request complete") }
 		s.structured = func() { mlog.InfoW("request complete", fields...) }
+		s.inlineStructured = func() {
+			mlog.InfoW("request complete", zap.String("request_id", "req-123"), zap.Int("user_id", 42), zap.String("method", "GET"), zap.Int("status", 200), zap.Bool("cached", true))
+		}
 		s.disabled = func() { mlog.Debug("request %d", 42) }
 		s.formatted = func() { mlog.Info("request %d status %s", 42, "ok") }
 		s.finish = func() { mlog.Close() }
@@ -65,10 +69,13 @@ func newSubject(t testing.TB, name string) *subject {
 	}
 	switch name {
 	case "zap":
-		l := zap.New(zapcore.NewCore(cfg.Encoder(), zapcore.AddSync(writer), zapcore.InfoLevel))
+		l := zap.New(zapcore.NewCore(referenceZapEncoder(), zapcore.AddSync(writer), zapcore.InfoLevel))
 		sugar := l.Sugar()
 		s.plain = func() { l.Info("request complete") }
 		s.structured = func() { l.Info("request complete", fields...) }
+		s.inlineStructured = func() {
+			l.Info("request complete", zap.String("request_id", "req-123"), zap.Int("user_id", 42), zap.String("method", "GET"), zap.Int("status", 200), zap.Bool("cached", true))
+		}
 		s.disabled = func() { sugar.Debugf("request %d", 42) }
 		s.formatted = func() { sugar.Infof("request %d status %s", 42, "ok") }
 	case "slog":
@@ -102,6 +109,7 @@ func newSubject(t testing.TB, name string) *subject {
 		s.structured = func() {
 			l.Info().Str("request_id", "req-123").Int("user_id", 42).Str("method", "GET").Int("status", 200).Bool("cached", true).Msg("request complete")
 		}
+		s.inlineStructured = s.structured
 		s.disabled = func() { l.Debug().Msgf("request %d", 42) }
 		s.formatted = func() { l.Info().Msgf("request %d status %s", 42, "ok") }
 	case "logrus":
@@ -253,4 +261,15 @@ func BenchmarkNativeDiscard(b *testing.B) {
 			}
 		})
 	}
+}
+
+// referenceZapEncoder is fixed across mlog revisions, preserving the shared
+// JSON schema without inheriting mlog's historical time-format allocation.
+func referenceZapEncoder() zapcore.Encoder {
+	return zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+		TimeKey: "time", NameKey: "name", LevelKey: "level", CallerKey: "caller", MessageKey: "message",
+		LineEnding: zapcore.DefaultLineEnding, EncodeTime: zapcore.TimeEncoderOfLayout(timeLayout),
+		EncodeLevel: zapcore.LowercaseLevelEncoder, EncodeCaller: zapcore.FullCallerEncoder,
+		EncodeDuration: zapcore.SecondsDurationEncoder,
+	})
 }

@@ -48,6 +48,7 @@ func (c *ZapConfig) Levels() []zapcore.Level {
 }
 
 func (c *ZapConfig) Encoder() zapcore.Encoder {
+	appendTime := zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05.000")
 	config := zapcore.EncoderConfig{
 		TimeKey:       "time",
 		NameKey:       "name",
@@ -57,6 +58,12 @@ func (c *ZapConfig) Encoder() zapcore.Encoder {
 		StacktraceKey: c.StacktraceKey,
 		LineEnding:    zapcore.DefaultLineEnding,
 		EncodeTime: func(t time.Time, encoder zapcore.PrimitiveArrayEncoder) {
+			// Keep observing Prefix on the receiver, as the original public
+			// Encoder method did, but avoid a temporary string when it is empty.
+			if c.Prefix == "" {
+				appendTime(t, encoder)
+				return
+			}
 			encoder.AppendString(c.Prefix + t.Format("2006-01-02 15:04:05.000"))
 		},
 		EncodeLevel:    c.LevelEncoder(),

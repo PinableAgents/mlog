@@ -33,6 +33,10 @@ func formatMessage(msg string, args []any, isAsync bool) string {
 		return SafeFormat(msg, args...)
 	}
 
+	if strings.Contains(msg, "%") {
+		// Do not copy fmt's completed string into a second builder buffer.
+		return formatPrintf(msg, args)
+	}
 	var sb strings.Builder
 	formatToStringBuilder(&sb, msg, args...)
 	return sb.String()
@@ -57,7 +61,7 @@ func zapUpdateLevel(logLevel string) {
 	if atomicLevel.Level() <= zapcore.DebugLevel {
 		logger, ok := getLogger()
 		if ok {
-			loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(2))
+			loggerWithSkip := withCachedCallerSkip(logger, 2)
 			loggerWithSkip.Debug("日志级别已更新",
 				zap.String("level", logLevel),
 				zap.Stringer("parsed_level", level))
@@ -94,7 +98,7 @@ func zapDebug(msg string, args ...any) {
 			return
 		}
 
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(2))
+		loggerWithSkip := withCachedCallerSkip(logger, 2)
 
 		formattedMsg := formatMessage(msg, args, false)
 		loggerWithSkip.Debug(formattedMsg)
@@ -110,7 +114,7 @@ func zapInfo(arg0 string, args ...any) {
 			return
 		}
 
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(2))
+		loggerWithSkip := withCachedCallerSkip(logger, 2)
 
 		formattedMsg := formatMessage(arg0, args, false)
 		loggerWithSkip.Info(formattedMsg)
@@ -126,7 +130,7 @@ func zapWarn(arg0 string, args ...any) {
 			return
 		}
 
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(2))
+		loggerWithSkip := withCachedCallerSkip(logger, 2)
 
 		formattedMsg := formatMessage(arg0, args, false)
 		loggerWithSkip.Warn(formattedMsg)
@@ -142,7 +146,7 @@ func zapError(arg0 string, args ...any) {
 			return
 		}
 
-		loggerWithSkip := logger.WithOptions(zap.AddCallerSkip(2))
+		loggerWithSkip := withCachedCallerSkip(logger, 2)
 
 		formattedMsg := formatMessage(arg0, args, false)
 		loggerWithSkip.Error(formattedMsg)
@@ -173,29 +177,29 @@ func formatToStringBuilder(sb *strings.Builder, format string, args ...any) {
 		return
 	}
 
+	sb.WriteString(formatPrintf(format, args))
+}
+
+// formatPrintf retains the legacy single-argument fast cases and fmt's exact
+// handling of mismatched verbs/arguments. SafetyMode still selects SafeFormat
+// before reaching this helper.
+func formatPrintf(format string, args []any) string {
 	if len(args) == 1 {
 		switch format {
 		case "%s":
 			if s, ok := args[0].(string); ok {
-				sb.WriteString(s)
-				return
+				return s
 			}
 		case "%d":
 			if i, ok := args[0].(int); ok {
-				sb.WriteString(strconv.Itoa(i))
-				return
+				return strconv.Itoa(i)
 			}
 			if i, ok := args[0].(int64); ok {
-				sb.WriteString(strconv.FormatInt(i, 10))
-				return
+				return strconv.FormatInt(i, 10)
 			}
 		case "%v":
-			sb.WriteString(fmt.Sprint(args[0]))
-			return
+			return fmt.Sprint(args[0])
 		}
 	}
-
-	formatted := fmt.Sprintf(format, args...)
-	sb.WriteString(formatted)
-	return
+	return fmt.Sprintf(format, args...)
 }

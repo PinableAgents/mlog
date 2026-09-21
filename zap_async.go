@@ -11,10 +11,9 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var (
-	globalAsyncLogger *AsyncLogger
-	asyncMutex        sync.RWMutex
-)
+// Publication is atomic; the queue's acceptMu still serializes acceptance
+// against Close, and globalMutex still owns initialization/reconfiguration.
+var globalAsyncLogger atomic.Pointer[AsyncLogger]
 
 type AsyncLogEntry struct {
 	preparedCore zapcore.Core // immutable encoded field context, owned by this entry
@@ -385,9 +384,8 @@ func (al *AsyncLogger) errorAsync(msg string, args []any, fields ...zap.Field) {
 }
 
 func getAsyncLogger() (*AsyncLogger, bool) {
-	asyncMutex.RLock()
-	defer asyncMutex.RUnlock()
-	return globalAsyncLogger, globalAsyncLogger != nil
+	logger := globalAsyncLogger.Load()
+	return logger, logger != nil
 }
 
 func debugAsync(msg string, args []any, fields ...zap.Field) {
@@ -396,7 +394,7 @@ func debugAsync(msg string, args []any, fields ...zap.Field) {
 		logger.logAsyncWithSkip(zapcore.DebugLevel, msg, args, 3, fields...)
 	} else {
 		if logger := getLoggerOptimized(); logger != nil {
-			logger.WithOptions(zap.AddCallerSkip(2)).Debug(formatMessage(msg, args, false), fields...)
+			withCachedCallerSkip(logger, 2).Debug(formatMessage(msg, args, false), fields...)
 		}
 	}
 }
@@ -406,7 +404,7 @@ func infoAsync(msg string, args []any, fields ...zap.Field) {
 		logger.logAsyncWithSkip(zapcore.InfoLevel, msg, args, 3, fields...)
 	} else {
 		if logger := getLoggerOptimized(); logger != nil {
-			logger.WithOptions(zap.AddCallerSkip(2)).Info(formatMessage(msg, args, false), fields...)
+			withCachedCallerSkip(logger, 2).Info(formatMessage(msg, args, false), fields...)
 		}
 	}
 }
@@ -416,7 +414,7 @@ func warnAsync(msg string, args []any, fields ...zap.Field) {
 		logger.logAsyncWithSkip(zapcore.WarnLevel, msg, args, 3, fields...)
 	} else {
 		if logger := getLoggerOptimized(); logger != nil {
-			logger.WithOptions(zap.AddCallerSkip(2)).Warn(formatMessage(msg, args, false), fields...)
+			withCachedCallerSkip(logger, 2).Warn(formatMessage(msg, args, false), fields...)
 		}
 	}
 }
@@ -426,7 +424,7 @@ func errorAsync(msg string, args []any, fields ...zap.Field) {
 		logger.logAsyncWithSkip(zapcore.ErrorLevel, msg, args, 3, fields...)
 	} else {
 		if logger := getLoggerOptimized(); logger != nil {
-			logger.WithOptions(zap.AddCallerSkip(2)).Error(formatMessage(msg, args, false), fields...)
+			withCachedCallerSkip(logger, 2).Error(formatMessage(msg, args, false), fields...)
 		}
 	}
 }
@@ -445,9 +443,7 @@ func ClearAsyncCache() {
 }
 
 func UpdateAsyncLevelCache() {
-	asyncMutex.RLock()
-	logger := globalAsyncLogger
-	asyncMutex.RUnlock()
+	logger := globalAsyncLogger.Load()
 
 	if logger != nil {
 		logger.UpdateLevelCache()
