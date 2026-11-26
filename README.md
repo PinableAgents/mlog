@@ -74,3 +74,7 @@ cd benchmarks
 go test -race -run '^TestCompletedOutput$' ./...
 go test -run '^$' -bench . -benchmem -benchtime=200ms -count=5 -cpu=4 ./...
 ```
+
+## 许可证
+
+mlog 的自研代码采用 [GNU Affero General Public License v3.0 only（AGPL-3.0-only）](./LICENSE)，与 Pinable Desktop 的项目许可保持一致。第三方代码和依赖仍依据各自的原始许可，本声明不改变其适用条款。
